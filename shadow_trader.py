@@ -11,12 +11,14 @@
 # データ: 擬似1分足風のOHLCVを内部生成（ボラレジーム＋ランダムショック）
 
 import sys
+import os
 import math
 import random
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import pygame
+import pygame.freetype
 import numpy as np
 import pandas as pd
 
@@ -28,9 +30,9 @@ FPS = 30
 HISTORY = 80          # 表示するバー本数
 ROUND_FRAMES = FPS*3  # 1ラウンド（次の1本確定まで）の秒数
 
-# フォント（英語/日本語切替用）
-FONT_NAME_EN = "DejaVu Sans"
-FONT_NAME_JP = "Noto Sans CJK JP"  # 日本語表示用（例: Meiryo, Noto Sans 等）
+# フォント候補
+FONT_BUNDLED = os.path.join(os.path.dirname(__file__), "assets", "fonts", "NotoSansJP-Regular.otf")
+FONT_CANDIDATES = ["Meiryo", "Yu Gothic", "MS Gothic"]
 
 # 色
 COL_BG = (12, 14, 22)
@@ -142,10 +144,10 @@ def rsi(series: List[float], n=14) -> List[float]:
 class ShadowTrader:
     def __init__(self):
         pygame.init()
+        pygame.freetype.init()
         pygame.display.set_caption("ShadowTrader - Candle & Tech MVP")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
-        self.use_jp_font = False  # フォント切替フラグ
         self.load_fonts()
 
         # チャート領域
@@ -179,12 +181,28 @@ class ShadowTrader:
         self.conf = 0.6
 
     def load_fonts(self):
-        """現在の設定に応じたフォントを読み込む。"""
-        name = FONT_NAME_JP if self.use_jp_font else FONT_NAME_EN
-        self.font = pygame.font.SysFont(name, 18)
-        self.font_small = pygame.font.SysFont(name, 14)
-        self.font_big = pygame.font.SysFont(name, 24)
-        self.font_big_bold = pygame.font.SysFont(name, 24, bold=True)
+        """日本語フォントを優先して読み込む。"""
+        font_path = None
+        if os.path.exists(FONT_BUNDLED):
+            font_path = FONT_BUNDLED
+        else:
+            for name in FONT_CANDIDATES:
+                matched = pygame.font.match_font(name)
+                if matched:
+                    font_path = matched
+                    break
+        def make(size, bold=False):
+            if font_path:
+                f = pygame.freetype.Font(font_path, size)
+            else:
+                f = pygame.freetype.SysFont(None, size)
+            if bold:
+                f.style |= pygame.freetype.STYLE_STRONG
+            return f
+        self.font = make(18)
+        self.font_small = make(14)
+        self.font_big = make(24)
+        self.font_big_bold = make(24, bold=True)
 
     # -------- 進行 --------
     def update(self):
@@ -250,7 +268,7 @@ class ShadowTrader:
             y = self.chart_rect.top + self.chart_rect.height*(1-y_frac)
             pygame.draw.line(self.screen, (28,32,50), (self.chart_rect.left, y), (self.chart_rect.right, y), 1)
             price = min_p + rng*y_frac
-            lab = self.font_small.render(f"{price:,.2f}", True, COL_DIM)
+            lab, _ = self.font_small.render(f"{price:,.2f}", COL_DIM)
             self.screen.blit(lab, (self.chart_rect.right+8, y-8))
 
         # 指標描画のためクローズ配列も用意
@@ -309,7 +327,8 @@ class ShadowTrader:
 
         def put(text, col=COL_WHITE):
             nonlocal txt_y
-            self.screen.blit(self.font.render(text, True, col), (self.side_rect.left + 10, txt_y))
+            surf, _ = self.font.render(text, col)
+            self.screen.blit(surf, (self.side_rect.left + 10, txt_y))
             txt_y += 24
 
         put("Hints", COL_YELLOW)
@@ -369,12 +388,13 @@ class ShadowTrader:
         ]
         x = 20
         for t in infos:
-            label = self.font.render(t, True, COL_WHITE)
+            label, _ = self.font.render(t, COL_WHITE)
             self.screen.blit(label, (x, base_y))
             x += 150
 
-        controls = "↑UP  ↓DOWN  Space=PASS  ←/→=Confidence  1/2/3/4=Indicators  F=Font  H=Help  P=Pause  R=Reset"
-        self.screen.blit(self.font_small.render(controls, True, COL_DIM), (20, base_y+26))
+        controls = "↑UP  ↓DOWN  Space=PASS  ←/→=Confidence  1/2/3/4=Indicators  H=Help  P=Pause  R=Reset"
+        surf, _ = self.font_small.render(controls, COL_DIM)
+        self.screen.blit(surf, (20, base_y+26))
 
     def draw_help(self):
         # 半透明パネル
@@ -395,7 +415,7 @@ class ShadowTrader:
             "  - VWAP: その日の出来高加重平均。価格が大きく乖離すると戻る“磁力”が働く場面がある。",
             "  - RSI(14): 70超=買われ過ぎ、30未満=売られ過ぎの目安。",
             "",
-            "操作: ↑=上, ↓=下, Space=見送り, ←/→=確信度, 1/2/3/4=指標表示切替, F=フォント切替, P=一時停止, R=リセット, H=この画面",
+            "操作: ↑=上, ↓=下, Space=見送り, ←/→=確信度, 1/2/3/4=指標表示切替, P=一時停止, R=リセット, H=この画面",
             "スコア: 対数スコア。確信を高く宣言して外すと減点が大きい（現実のリスク管理に近い）。",
             "",
             "戦略ヒント:",
@@ -408,7 +428,7 @@ class ShadowTrader:
         y = 100
         for i, ln in enumerate(lines):
             font = self.font_big_bold if i == 0 else self.font
-            label = font.render(ln, True, COL_WHITE)
+            label, _ = font.render(ln, COL_WHITE)
             self.screen.blit(label, (80, y))
             y += 26
 
@@ -435,9 +455,6 @@ class ShadowTrader:
                 self.show_vwap = not self.show_vwap
             elif e.key == pygame.K_4:
                 self.show_rsi = not self.show_rsi
-            elif e.key == pygame.K_f:
-                self.use_jp_font = not self.use_jp_font
-                self.load_fonts()
             elif e.key == pygame.K_h:
                 self.show_help = not self.show_help
             elif e.key == pygame.K_r:
