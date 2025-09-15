@@ -27,7 +27,10 @@ WIDTH, HEIGHT = 950, 700
 FPS = 30
 HISTORY = 80          # 表示するバー本数
 ROUND_FRAMES = FPS*3  # 1ラウンド（次の1本確定まで）の秒数
-FONT_NAME = "consolas"
+
+# フォント（英語/日本語切替用）
+FONT_NAME_EN = "DejaVu Sans"
+FONT_NAME_JP = "Noto Sans CJK JP"  # 日本語表示用（例: Meiryo, Noto Sans 等）
 
 # 色
 COL_BG = (12, 14, 22)
@@ -142,9 +145,8 @@ class ShadowTrader:
         pygame.display.set_caption("ShadowTrader - Candle & Tech MVP")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont(FONT_NAME, 18)
-        self.font_small = pygame.font.SysFont(FONT_NAME, 14)
-        self.font_big = pygame.font.SysFont(FONT_NAME, 24)
+        self.use_jp_font = False  # フォント切替フラグ
+        self.load_fonts()
 
         # チャート領域
         self.chart_rect = pygame.Rect(50, 50, 680, 460)
@@ -175,6 +177,14 @@ class ShadowTrader:
         self.streak = 0
         self.pred = None         # "UP" / "DOWN" / "PASS" / None
         self.conf = 0.6
+
+    def load_fonts(self):
+        """現在の設定に応じたフォントを読み込む。"""
+        name = FONT_NAME_JP if self.use_jp_font else FONT_NAME_EN
+        self.font = pygame.font.SysFont(name, 18)
+        self.font_small = pygame.font.SysFont(name, 14)
+        self.font_big = pygame.font.SysFont(name, 24)
+        self.font_big_bold = pygame.font.SysFont(name, 24, bold=True)
 
     # -------- 進行 --------
     def update(self):
@@ -303,24 +313,28 @@ class ShadowTrader:
             txt_y += 24
 
         put("Hints", COL_YELLOW)
-        # mom
+        # Momentum
         mom_k = pd.Series(closes).pct_change().rolling(5).mean().iloc[-1] if len(closes) >= 6 else 0.0
         mom_k = 0.0 if pd.isna(mom_k) else float(mom_k)
-        put(f"Momentum(5): {mom_k*100:+.2f}%")
+        arrow = "▲" if mom_k > 0 else ("▼" if mom_k < 0 else "→")
+        put(f"{arrow} Momentum(5): {mom_k*100:+.2f}%")
 
-        # vwap 乖離
+        # VWAP 乖離
         vwap_list = vwap_from_bars(self.bars[-HISTORY:])
         if vwap_list:
             vwap_val = vwap_list[-1]
             gap = (closes[-1] / vwap_val - 1.0) if vwap_val else 0.0
-            put(f"VWAP dev: {gap*100:+.2f}%")
+            put(f"± VWAP dev: {gap*100:+.2f}%")
 
         # RSI
         if self.show_rsi:
             rsi_arr = rsi(closes, 14)
             r = rsi_arr[-1] if len(rsi_arr) else float("nan")
             if not math.isnan(r):
-                put(f"RSI(14): {r:5.1f}")
+                bars = "▁▂▃▄▅▆▇█"
+                level = int(max(0, min(7, r/100*7)))
+                gauge = bars[level]
+                put(f"{gauge} RSI(14): {r:5.1f}")
                 # 簡易ヒント
                 tip = ""
                 if r > 70: tip = "Overbought? ↓"
@@ -340,8 +354,11 @@ class ShadowTrader:
         put("[4] RSI    " + ("ON" if self.show_rsi else "OFF"), COL_DIM)
 
     def draw_footer(self):
-        # フッター情報＆操作
-        base_y = 540
+        # 画面最下部の帯にフッター情報を表示
+        footer_rect = pygame.Rect(0, HEIGHT-60, WIDTH, 60)
+        pygame.draw.rect(self.screen, (20, 24, 36), footer_rect)
+        pygame.draw.rect(self.screen, COL_GRID, footer_rect, 1)
+        base_y = footer_rect.top + 10
         infos = [
             f"Round {self.round}",
             f"Timer {self.round_timer//FPS}s",
@@ -350,21 +367,22 @@ class ShadowTrader:
             f"Confidence {self.conf:.1f}",
             f"Pred {self.pred}",
         ]
-        x = 50
+        x = 20
         for t in infos:
             label = self.font.render(t, True, COL_WHITE)
             self.screen.blit(label, (x, base_y))
-            x += 140
+            x += 150
 
-        controls = "↑UP  ↓DOWN  Space=PASS  ←/→=Confidence  1/2/3/4=Indicators  H=Help  P=Pause  R=Reset"
-        self.screen.blit(self.font_small.render(controls, True, COL_DIM), (50, base_y+28))
+        controls = "↑UP  ↓DOWN  Space=PASS  ←/→=Confidence  1/2/3/4=Indicators  F=Font  H=Help  P=Pause  R=Reset"
+        self.screen.blit(self.font_small.render(controls, True, COL_DIM), (20, base_y+26))
 
     def draw_help(self):
         # 半透明パネル
         surf = pygame.Surface((WIDTH-120, HEIGHT-160), pygame.SRCALPHA)
-        surf.fill((10, 10, 10, 220))
+        surf.fill((0, 0, 0, 240))  # 背景を濃くして視認性向上
         rect = surf.get_rect()
         rect.topleft = (60, 80)
+        self.screen.blit(surf, rect)
         lines = [
             "ShadowTrader チュートリアル（超入門）",
             "",
@@ -377,7 +395,7 @@ class ShadowTrader:
             "  - VWAP: その日の出来高加重平均。価格が大きく乖離すると戻る“磁力”が働く場面がある。",
             "  - RSI(14): 70超=買われ過ぎ、30未満=売られ過ぎの目安。",
             "",
-            "操作: ↑=上, ↓=下, Space=見送り, ←/→=確信度, 1/2/3/4=指標表示切替, P=一時停止, R=リセット, H=この画面",
+            "操作: ↑=上, ↓=下, Space=見送り, ←/→=確信度, 1/2/3/4=指標表示切替, F=フォント切替, P=一時停止, R=リセット, H=この画面",
             "スコア: 対数スコア。確信を高く宣言して外すと減点が大きい（現実のリスク管理に近い）。",
             "",
             "戦略ヒント:",
@@ -388,12 +406,13 @@ class ShadowTrader:
             "Hで閉じる。",
         ]
         y = 100
-        for ln in lines:
-            label = self.font_big.render(ln, True, COL_WHITE) if "チュートリアル" in ln else self.font.render(ln, True, COL_WHITE)
+        for i, ln in enumerate(lines):
+            font = self.font_big_bold if i == 0 else self.font
+            label = font.render(ln, True, COL_WHITE)
             self.screen.blit(label, (80, y))
             y += 26
 
-        pygame.draw.rect(self.screen, COL_WHITE, rect, 1)
+        pygame.draw.rect(self.screen, COL_WHITE, rect, 2)
 
     # -------- 入力 --------
     def handle_event(self, e: pygame.event.Event):
@@ -416,6 +435,9 @@ class ShadowTrader:
                 self.show_vwap = not self.show_vwap
             elif e.key == pygame.K_4:
                 self.show_rsi = not self.show_rsi
+            elif e.key == pygame.K_f:
+                self.use_jp_font = not self.use_jp_font
+                self.load_fonts()
             elif e.key == pygame.K_h:
                 self.show_help = not self.show_help
             elif e.key == pygame.K_r:
