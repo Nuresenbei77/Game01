@@ -26,10 +26,14 @@ import pandas as pd
 WIDTH, HEIGHT = 1100, 760
 FPS = 30
 HISTORY = 90              # 表示するバー本数
-STREAM_FRAMES = FPS * 6   # 観察フェーズの長さ（秒数）
-POST_FRAMES = FPS * 6     # 回答後に結果を観察する長さ
-TICKS_PER_FRAME = 6       # 1フレーム内で生成する歩み値数
-TICKS_PER_MINUTE = 60     # 疑似1分を構成する歩み値数
+SIM_SECONDS_PER_MINUTE = 30  # 疑似1分足が経過する現実秒
+TICKS_PER_MINUTE = 60        # 疑似1分を構成する歩み値数
+TICKS_PER_SECOND = TICKS_PER_MINUTE / SIM_SECONDS_PER_MINUTE
+TICKS_PER_FRAME_TARGET = TICKS_PER_SECOND / FPS
+STREAM_SECONDS = 20          # 観察フェーズ（実時間秒）
+POST_SECONDS = 10            # 回答後の結果観察（実時間秒）
+STREAM_FRAMES = int(STREAM_SECONDS * FPS)
+POST_FRAMES = int(POST_SECONDS * FPS)
 
 # フォント候補
 FONT_BUNDLED = os.path.join(os.path.dirname(__file__), "assets", "fonts", "NotoSansJP-Regular.otf")
@@ -268,6 +272,7 @@ class ShadowTrader:
         self.range_threshold = 0.0015
         self.recent_event: Optional[str] = None
         self.result_flash_timer = 0
+        self.tick_accumulator = 0.0
         self.reset_game()
 
         # 表示切替
@@ -300,11 +305,19 @@ class ShadowTrader:
         self.anchor_price = None
         self.recent_event = None
         self.order_book = self.sim.order_book()
+        self.tick_accumulator = 0.0
 
         # 初期化のため疑似的に履歴を生成
-        bootstrap_frames = (HISTORY + 10) * TICKS_PER_MINUTE // max(TICKS_PER_FRAME, 1)
-        for _ in range(max(bootstrap_frames, 1)):
-            self.advance_market()
+        bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
+        remaining = max(bootstrap_ticks, 1)
+        while remaining > 0:
+            step = min(remaining, TICKS_PER_MINUTE)
+            ticks, _ = self.sim.step_ticks(step)
+            self._ingest_market_updates(ticks, headline=None)
+            remaining -= step
+        # ブートストラップ時はイベントをクリアして新鮮な状態にする
+        self.event_log.clear()
+        self.recent_event = None
 
     def load_fonts(self):
         """日本語フォントを優先して読み込む。"""
@@ -369,8 +382,7 @@ class ShadowTrader:
         self.font_big_bold = make(24, bold=True)
 
     # -------- 進行 --------
-    def advance_market(self):
-        ticks, headline = self.sim.step_ticks(TICKS_PER_FRAME)
+    def _ingest_market_updates(self, ticks: List[Tick], headline: Optional[str]):
         if ticks:
             self.order_book = self.sim.order_book()
         for tick in ticks:
@@ -381,7 +393,18 @@ class ShadowTrader:
             self._update_minute_bar(tick)
         if headline:
             self.recent_event = headline
-            self.event_log.appendleft((headline, FPS * 8))
+            self.event_log.appendleft((headline, int(FPS * 8)))
+
+    def advance_market(self, tick_budget: Optional[int] = None):
+        if tick_budget is None:
+            self.tick_accumulator += TICKS_PER_FRAME_TARGET
+            tick_budget = int(self.tick_accumulator)
+            self.tick_accumulator -= tick_budget
+        ticks: List[Tick] = []
+        headline: Optional[str] = None
+        if tick_budget > 0:
+            ticks, headline = self.sim.step_ticks(tick_budget)
+            self._ingest_market_updates(ticks, headline)
         self._decay_events()
 
     def _decay_events(self):
