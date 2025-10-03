@@ -745,43 +745,92 @@ class ShadowTrader:
             self.screen.blit(label, (rect.left + 20, rect.top + 6))
 
     def draw_question_overlay(self):
-        overlay = pygame.Surface((WIDTH-140, HEIGHT-200), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 220))
-        rect = overlay.get_rect()
-        rect.topleft = (70, 90)
-        self.screen.blit(overlay, rect)
+        panel = pygame.Surface(self.side_rect.size, pygame.SRCALPHA)
+        panel.fill((8, 12, 24, 225))
+        pygame.draw.rect(panel, (120, 140, 200, 140), panel.get_rect(), 1, border_radius=10)
 
-        lines = [
-            "テクニカル注目ポイント", 
-            self.question_reason,
-            "",
-            "次の展開は？ (Enterで決定)",
-            f"現在の確信度: {self.conf:.1f}",
-        ]
-        y = rect.top + 30
-        for i, ln in enumerate(lines):
-            font = self.font_big_bold if i == 0 else self.font
-            label, _ = font.render(ln, COL_WHITE)
-            self.screen.blit(label, (rect.left + 40, y))
-            y += 32
+        margin = 16
+        inner_width = panel.get_width() - margin * 2
+        y = margin
+
+        def wrap_lines(text: str, font_obj: pygame.freetype.Font, max_width: int):
+            lines = []
+            for raw_line in text.replace(" / ", "\n").split("\n"):
+                if raw_line == "":
+                    lines.append("")
+                    continue
+                current = ""
+                for ch in raw_line:
+                    if ch == "\r":
+                        continue
+                    candidate = current + ch
+                    surf, _ = font_obj.render(candidate, COL_WHITE)
+                    if surf.get_width() <= max_width:
+                        current = candidate
+                    else:
+                        if current:
+                            lines.append(current)
+                        current = ch
+                if current:
+                    lines.append(current)
+            return lines
+
+        title, _ = self.font_big_bold.render("テクニカル注目ポイント", COL_YELLOW)
+        panel.blit(title, (margin, y))
+        y += title.get_height() + 10
+
+        bullet_color = COL_WHITE
+        for reason in self.question_reason.split(" / "):
+            bullet = "・" if reason else ""
+            wrapped = wrap_lines(reason, self.font_small, inner_width - 18) if reason else [""]
+            for i, line in enumerate(wrapped):
+                prefix = bullet if i == 0 else "  "
+                text_line = f"{prefix}{line}" if line else prefix
+                surf, _ = self.font_small.render(text_line, bullet_color)
+                panel.blit(surf, (margin, y))
+                y += surf.get_height() + 4
+            y += 2
+
+        y += 8
+        prompt_lines = wrap_lines("次の展開は？ (Enterで決定)", self.font, inner_width)
+        for line in prompt_lines:
+            surf, _ = self.font.render(line, COL_WHITE)
+            panel.blit(surf, (margin, y))
+            y += surf.get_height() + 6
+
+        conf_text = f"現在の確信度: {self.conf:.1f}"
+        conf_surf, conf_rect = self.font_small.render(conf_text, COL_BLUE)
+        panel.blit(conf_surf, (margin, y))
+        y += conf_rect.height + 10
 
         choices = [
             ("UP", "上昇する", pygame.K_UP),
             ("DOWN", "下落する", pygame.K_DOWN),
             ("RANGE", "もみ合う", pygame.K_SPACE),
         ]
-        y += 10
+        choice_box_w = inner_width
         for key, text, _ in choices:
             selected = key == self.pred_choice
-            col = COL_GREEN if selected else COL_WHITE
             marker = "▶" if selected else "  "
-            label, _ = self.font_big.render(f"{marker} {text}", col)
-            self.screen.blit(label, (rect.left + 80, y))
-            y += 40
+            label, label_rect = self.font_big.render(f"{marker} {text}", COL_WHITE)
+            line_height = label_rect.height
+            if selected:
+                highlight = pygame.Surface((choice_box_w, line_height + 8), pygame.SRCALPHA)
+                highlight.fill((*COL_GREEN, 70))
+                panel.blit(highlight, (margin - 4, y - 4))
+                label, _ = self.font_big.render(f"{marker} {text}", COL_GREEN)
+            panel.blit(label, (margin, y))
+            y += line_height + 12
 
         hint = "↑/↓/Spaceで選択  ←/→で確信度  Enterで回答"
-        surf, _ = self.font_small.render(hint, COL_DIM)
-        self.screen.blit(surf, (rect.left + 40, rect.bottom - 60))
+        hint_surf, hint_rect = self.font_small.render(hint, COL_YELLOW)
+        hint_bg = pygame.Surface((inner_width, hint_rect.height + 10), pygame.SRCALPHA)
+        hint_bg.fill((255, 255, 255, 30))
+        hint_y = panel.get_height() - margin - hint_rect.height - 6
+        panel.blit(hint_bg, (margin, hint_y - 4))
+        panel.blit(hint_surf, (margin + 4, hint_y))
+
+        self.screen.blit(panel, self.side_rect)
 
     def _draw_line_indicator(self, arr, min_p, rng, color, px_w, width=1):
         pts = []
