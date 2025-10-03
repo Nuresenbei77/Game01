@@ -192,13 +192,19 @@ class ShadowTrader:
                     font_path = matched
                     break
         def make(size, bold=False):
+            nonlocal font_path
+            font_obj = None
             if font_path:
-                f = pygame.freetype.Font(font_path, size)
-            else:
-                f = pygame.freetype.SysFont(None, size)
+                try:
+                    font_obj = pygame.freetype.Font(font_path, size)
+                except (OSError, FileNotFoundError, pygame.error) as exc:
+                    print(f"[ShadowTrader] Failed to load bundled font '{font_path}': {exc}. Using system fallback.", file=sys.stderr)
+                    font_path = None
+            if font_path is None:
+                font_obj = pygame.freetype.SysFont(None, size)
             if bold:
-                f.style |= pygame.freetype.STYLE_STRONG
-            return f
+                font_obj.style |= pygame.freetype.STYLE_STRONG
+            return font_obj
         self.font = make(18)
         self.font_small = make(14)
         self.font_big = make(24)
