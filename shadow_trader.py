@@ -183,24 +183,56 @@ class ShadowTrader:
     def load_fonts(self):
         """日本語フォントを優先して読み込む。"""
         font_path = None
+        fallback_name = None
+        bundled_error = None
+
         if os.path.exists(FONT_BUNDLED):
-            font_path = FONT_BUNDLED
+            try:
+                pygame.freetype.Font(FONT_BUNDLED, 18)
+                font_path = FONT_BUNDLED
+            except (OSError, FileNotFoundError, pygame.error) as exc:
+                bundled_error = exc
         else:
+            bundled_error = FileNotFoundError(FONT_BUNDLED)
+
+        if font_path is None:
             for name in FONT_CANDIDATES:
                 matched = pygame.font.match_font(name)
-                if matched:
-                    font_path = matched
-                    break
+                if not matched:
+                    continue
+                try:
+                    pygame.freetype.Font(matched, 18)
+                except (OSError, FileNotFoundError, pygame.error):
+                    continue
+                font_path = matched
+                fallback_name = name
+                break
+
+        if bundled_error is not None:
+            if font_path is not None:
+                chosen = fallback_name if fallback_name else os.path.basename(font_path)
+                print(
+                    f"[ShadowTrader] Failed to load bundled font '{FONT_BUNDLED}': {bundled_error}. Using fallback font '{chosen}'.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[ShadowTrader] Failed to load bundled font '{FONT_BUNDLED}': {bundled_error}. Using generic system font.",
+                    file=sys.stderr,
+                )
+
         def make(size, bold=False):
             nonlocal font_path
-            font_obj = None
             if font_path:
                 try:
                     font_obj = pygame.freetype.Font(font_path, size)
                 except (OSError, FileNotFoundError, pygame.error) as exc:
-                    print(f"[ShadowTrader] Failed to load bundled font '{font_path}': {exc}. Using system fallback.", file=sys.stderr)
-                    font_path = None
-            if font_path is None:
+                    print(
+                        f"[ShadowTrader] Failed to instantiate font '{font_path}' (size {size}): {exc}. Using generic system font.",
+                        file=sys.stderr,
+                    )
+                    font_obj = pygame.freetype.SysFont(None, size)
+            else:
                 font_obj = pygame.freetype.SysFont(None, size)
             if bold:
                 font_obj.style |= pygame.freetype.STYLE_STRONG
