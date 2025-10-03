@@ -669,7 +669,7 @@ class ShadowTrader:
             def Y(p): return self.chart_rect.bottom - (p - min_p)/rng * self.chart_rect.height
             y_o, y_h, y_l, y_c = map(Y, (b.o, b.h, b.l, b.c))
 
-            col = COL_GREEN if b.c >= b.o else COL_RED
+            col = COL_RED if b.c >= b.o else COL_GREEN
             # ヒゲ
             pygame.draw.line(self.screen, col, (cx, y_h), (cx, y_l), 1)
             # 実体
@@ -699,7 +699,7 @@ class ShadowTrader:
             y_l = Y(b.l)
             y_o = Y(b.o)
             y_c = Y(b.c)
-            col = COL_GREEN if b.c >= b.o else COL_RED
+            col = COL_RED if b.c >= b.o else COL_GREEN
             pygame.draw.line(self.screen, col, (cx, y_h), (cx, y_l), 1)
             body_top = min(y_o, y_c)
             body_h = max(2, abs(y_c - y_o))
@@ -717,7 +717,7 @@ class ShadowTrader:
         step = 18
         max_entries = 24
         for i, tick in enumerate(list(self.tick_tape)[:max_entries]):
-            col = COL_GREEN if tick.side == "BUY" else COL_RED
+            col = COL_RED if tick.side == "BUY" else COL_GREEN
             text = f"{tick.price:,.2f} ({int(tick.volume)})"
             surf, _ = self.font_small.render(text, col)
             self.screen.blit(surf, (x, y))
@@ -809,6 +809,11 @@ class ShadowTrader:
             ("RANGE", "もみ合う", pygame.K_SPACE),
         ]
         choice_box_w = inner_width
+        choice_colors = {
+            "UP": COL_RED,
+            "DOWN": COL_GREEN,
+            "RANGE": COL_BLUE,
+        }
         for key, text, _ in choices:
             selected = key == self.pred_choice
             marker = "▶" if selected else "  "
@@ -816,9 +821,10 @@ class ShadowTrader:
             line_height = label_rect.height
             if selected:
                 highlight = pygame.Surface((choice_box_w, line_height + 8), pygame.SRCALPHA)
-                highlight.fill((*COL_GREEN, 70))
+                sel_col = choice_colors.get(key, COL_YELLOW)
+                highlight.fill((*sel_col, 70))
                 panel.blit(highlight, (margin - 4, y - 4))
-                label, _ = self.font_big.render(f"{marker} {text}", COL_GREEN)
+                label, _ = self.font_big.render(f"{marker} {text}", choice_colors.get(key, COL_YELLOW))
             panel.blit(label, (margin, y))
             y += line_height + 12
 
@@ -881,12 +887,12 @@ class ShadowTrader:
         put("")
         put("板情報", COL_YELLOW)
         bids, asks = self.order_book
-        put("Ask", COL_RED)
+        put("Ask", COL_GREEN)
         for price, vol in asks[:5]:
-            put(f" {price:,.2f} x {int(vol)}", COL_RED)
-        put("Bid", COL_GREEN)
-        for price, vol in bids[:5]:
             put(f" {price:,.2f} x {int(vol)}", COL_GREEN)
+        put("Bid", COL_RED)
+        for price, vol in bids[:5]:
+            put(f" {price:,.2f} x {int(vol)}", COL_RED)
 
         put("")
         put("イベント", COL_YELLOW)
