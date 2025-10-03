@@ -273,6 +273,8 @@ class ShadowTrader:
         self.recent_event: Optional[str] = None
         self.result_flash_timer = 0
         self.tick_accumulator = 0.0
+        self.post_round_summary: str = ""
+        self.post_summary_ready: bool = False
         self.reset_game()
 
         # 表示切替
@@ -306,6 +308,8 @@ class ShadowTrader:
         self.recent_event = None
         self.order_book = self.sim.order_book()
         self.tick_accumulator = 0.0
+        self.post_round_summary = ""
+        self.post_summary_ready = False
 
         # 初期化のため疑似的に履歴を生成
         bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
@@ -470,8 +474,10 @@ class ShadowTrader:
             self.advance_market()
             self.phase_timer -= 1
             if self.phase_timer <= 0:
-                self.resolve_round()
-                self.start_stream_phase()
+                if not self.post_summary_ready:
+                    self.resolve_round()
+                else:
+                    self.start_stream_phase()
         if self.result_flash_timer > 0:
             self.result_flash_timer -= 1
 
@@ -481,6 +487,8 @@ class ShadowTrader:
         self.pred_choice = None
         self.question_reason = ""
         self.anchor_price = None
+        self.post_round_summary = ""
+        self.post_summary_ready = False
         self.round += 1
 
     def cycle_mode(self):
@@ -501,9 +509,14 @@ class ShadowTrader:
     def start_post_phase(self):
         self.phase = "post"
         self.phase_timer = POST_FRAMES
+        self.post_round_summary = ""
+        self.post_summary_ready = False
 
     def resolve_round(self):
         if self.anchor_price is None:
+            self.post_round_summary = "観測データ不足のため評価できませんでした"
+            self.post_summary_ready = True
+            self.phase_timer = POST_FRAMES
             return
         current_price = self.sim.last
         delta = (current_price - self.anchor_price) / max(self.anchor_price, 1e-6)
@@ -514,6 +527,9 @@ class ShadowTrader:
         else:
             actual = "DOWN"
 
+        self.post_round_summary = self.build_post_round_summary(actual, delta, self.anchor_price, current_price)
+        self.post_summary_ready = True
+        self.phase_timer = POST_FRAMES
         self.last_result = f"結果: {actual} (Δ {delta*100:+.2f}%)"
         self.result_flash_timer = FPS * 3
         self.evaluate_score(actual)
@@ -565,6 +581,89 @@ class ShadowTrader:
             reasons.append(f"イベント: {self.recent_event}")
         return " / ".join(reasons[:3])
 
+    def build_post_round_summary(
+        self, actual: str, delta: float, anchor: float, current_price: float
+    ) -> str:
+        direction_map = {"UP": "上昇", "DOWN": "下落", "RANGE": "もみ合い"}
+        actual_label = direction_map.get(actual, actual)
+        lines: List[str] = []
+        lines.append(
+            f"実現値動き: {anchor:,.2f}→{current_price:,.2f} ({delta*100:+.2f}%) → {actual_label}"
+        )
+
+        closes = [b.c for b in self.minute_bars[-HISTORY:]]
+        volumes = [b.v for b in self.minute_bars[-HISTORY:]]
+        indicator_parts: List[str] = []
+
+        if len(closes) >= 20:
+            ma20 = sma(closes, 20)
+            if ma20 and not math.isnan(ma20[-1]):
+                ma_now = ma20[-1]
+                ma_prev = ma20[-2] if len(ma20) > 1 and not math.isnan(ma20[-2]) else ma_now
+                slope = ma_now - ma_prev
+                slope_txt = "上向き" if slope > 0 else ("下向き" if slope < 0 else "横ばい")
+                gap = (current_price / ma_now - 1.0) if ma_now else 0.0
+                indicator_parts.append(f"SMA20 {slope_txt} 乖離{gap*100:+.2f}%")
+
+        if len(closes) >= 22:
+            ma_arr, upper, lower = bbands(closes, 20, 2.0)
+            if (
+                upper
+                and lower
+                and not math.isnan(upper[-1])
+                and not math.isnan(lower[-1])
+            ):
+                upper_now = upper[-1]
+                lower_now = lower[-1]
+                if current_price >= upper_now:
+                    indicator_parts.append("ボリンジャー+2σ上抜け")
+                elif current_price <= lower_now:
+                    indicator_parts.append("ボリンジャー-2σ下抜け")
+                elif ma_arr and not math.isnan(ma_arr[-1]):
+                    center = ma_arr[-1]
+                    if current_price >= center:
+                        indicator_parts.append("ボリンジャー上半分")
+                    else:
+                        indicator_parts.append("ボリンジャー下半分")
+
+        if len(closes) >= 15:
+            rsi_vals = rsi(closes, 14)
+            if rsi_vals and not math.isnan(rsi_vals[-1]):
+                r = rsi_vals[-1]
+                if r >= 70:
+                    indicator_parts.append(f"RSI14 {r:.0f} (買われ過ぎ)")
+                elif r <= 30:
+                    indicator_parts.append(f"RSI14 {r:.0f} (売られ過ぎ)")
+                else:
+                    indicator_parts.append(f"RSI14 {r:.0f}")
+
+        vwap_list = vwap_from_bars(self.minute_bars[-HISTORY:])
+        if vwap_list:
+            vwap_val = vwap_list[-1]
+            if vwap_val:
+                vwap_gap = (current_price / vwap_val - 1.0)
+                indicator_parts.append(f"VWAP乖離 {vwap_gap*100:+.2f}%")
+
+        if len(volumes) >= 2:
+            reference = volumes[-6:-1]
+            if reference:
+                avg_vol = sum(reference) / len(reference)
+                if avg_vol > 0:
+                    ratio = volumes[-1] / avg_vol
+                    if ratio >= 1.6:
+                        indicator_parts.append(f"出来高 {ratio:.1f}倍 (急増)")
+                    else:
+                        indicator_parts.append(f"出来高 {ratio:.1f}倍")
+
+        if indicator_parts:
+            lines.append("主要指標: " + " / ".join(indicator_parts[:4]))
+
+        reason = self.detect_setup_reason()
+        if reason:
+            lines.append(f"検出シグナル: {reason}")
+
+        return "\n".join(lines)
+
     def prediction_probs(self, choice: str) -> dict:
         rest = max(0.0, 1.0 - self.conf)
         if choice == "UP":
@@ -604,6 +703,8 @@ class ShadowTrader:
             self.draw_result_banner()
         if self.phase == "question":
             self.draw_question_overlay()
+        elif self.phase == "post":
+            self.draw_post_overlay()
 
         if self.show_help:
             self.draw_help()
@@ -744,6 +845,30 @@ class ShadowTrader:
             label, _ = self.font_big.render(self.last_result, COL_YELLOW)
             self.screen.blit(label, (rect.left + 20, rect.top + 6))
 
+    def _wrap_lines(
+        self, text: str, font_obj: pygame.freetype.Font, max_width: int
+    ) -> List[str]:
+        lines: List[str] = []
+        for raw_line in text.replace(" / ", "\n").split("\n"):
+            if raw_line == "":
+                lines.append("")
+                continue
+            current = ""
+            for ch in raw_line:
+                if ch == "\r":
+                    continue
+                candidate = current + ch
+                surf, _ = font_obj.render(candidate, COL_WHITE)
+                if surf.get_width() <= max_width:
+                    current = candidate
+                else:
+                    if current:
+                        lines.append(current)
+                    current = ch
+            if current:
+                lines.append(current)
+        return lines
+
     def draw_question_overlay(self):
         panel = pygame.Surface(self.side_rect.size, pygame.SRCALPHA)
         panel.fill((8, 12, 24, 225))
@@ -753,28 +878,6 @@ class ShadowTrader:
         inner_width = panel.get_width() - margin * 2
         y = margin
 
-        def wrap_lines(text: str, font_obj: pygame.freetype.Font, max_width: int):
-            lines = []
-            for raw_line in text.replace(" / ", "\n").split("\n"):
-                if raw_line == "":
-                    lines.append("")
-                    continue
-                current = ""
-                for ch in raw_line:
-                    if ch == "\r":
-                        continue
-                    candidate = current + ch
-                    surf, _ = font_obj.render(candidate, COL_WHITE)
-                    if surf.get_width() <= max_width:
-                        current = candidate
-                    else:
-                        if current:
-                            lines.append(current)
-                        current = ch
-                if current:
-                    lines.append(current)
-            return lines
-
         title, _ = self.font_big_bold.render("テクニカル注目ポイント", COL_YELLOW)
         panel.blit(title, (margin, y))
         y += title.get_height() + 10
@@ -782,7 +885,11 @@ class ShadowTrader:
         bullet_color = COL_WHITE
         for reason in self.question_reason.split(" / "):
             bullet = "・" if reason else ""
-            wrapped = wrap_lines(reason, self.font_small, inner_width - 18) if reason else [""]
+            wrapped = (
+                self._wrap_lines(reason, self.font_small, inner_width - 18)
+                if reason
+                else [""]
+            )
             for i, line in enumerate(wrapped):
                 prefix = bullet if i == 0 else "  "
                 text_line = f"{prefix}{line}" if line else prefix
@@ -792,7 +899,7 @@ class ShadowTrader:
             y += 2
 
         y += 8
-        prompt_lines = wrap_lines("次の展開は？ (Enterで決定)", self.font, inner_width)
+        prompt_lines = self._wrap_lines("次の展開は？ (Enterで決定)", self.font, inner_width)
         for line in prompt_lines:
             surf, _ = self.font.render(line, COL_WHITE)
             panel.blit(surf, (margin, y))
@@ -835,6 +942,62 @@ class ShadowTrader:
         hint_y = panel.get_height() - margin - hint_rect.height - 6
         panel.blit(hint_bg, (margin, hint_y - 4))
         panel.blit(hint_surf, (margin + 4, hint_y))
+
+        self.screen.blit(panel, self.side_rect)
+
+    def draw_post_overlay(self):
+        panel = pygame.Surface(self.side_rect.size, pygame.SRCALPHA)
+        panel.fill((10, 16, 30, 235))
+        pygame.draw.rect(panel, (200, 180, 80, 140), panel.get_rect(), 1, border_radius=10)
+
+        margin = 16
+        inner_width = panel.get_width() - margin * 2
+        y = margin
+
+        if self.post_summary_ready and self.post_round_summary:
+            title_text = "ラウンド結果サマリー"
+            sections = [line.strip() for line in self.post_round_summary.split("\n")]
+        else:
+            title_text = "結果観察フェーズ"
+            remaining = max(0, math.ceil(self.phase_timer / FPS))
+            sections = [
+                "値動きの確定を観察しています。",
+                f"残り {remaining}s",
+            ]
+
+        title_surf, _ = self.font_big_bold.render(title_text, COL_YELLOW)
+        panel.blit(title_surf, (margin, y))
+        y += title_surf.get_height() + 12
+
+        info_color = COL_WHITE
+        for raw_section in sections:
+            if raw_section == "":
+                y += 6
+                continue
+            wrapped_lines = self._wrap_lines(raw_section, self.font_small, inner_width - 18)
+            for i, line in enumerate(wrapped_lines):
+                prefix = "・" if i == 0 else "  "
+                text_line = f"{prefix}{line}" if line else prefix
+                surf, _ = self.font_small.render(text_line, info_color)
+                panel.blit(surf, (margin, y))
+                y += surf.get_height() + 4
+            y += 4
+
+        y += 6
+        if self.post_summary_ready:
+            last_result_text = self.last_result or "結果集計中"
+        else:
+            last_result_text = "結果集計中"
+        result_lines = self._wrap_lines(last_result_text, self.font_small, inner_width)
+        for line in result_lines:
+            surf, _ = self.font_small.render(line, COL_BLUE)
+            panel.blit(surf, (margin, y))
+            y += surf.get_height() + 4
+
+        choice_display = self.pred_choice or "-"
+        choice_text = f"回答: {choice_display} / 確信度 {self.conf:.1f}"
+        choice_surf, choice_rect = self.font_small.render(choice_text, COL_DIM)
+        panel.blit(choice_surf, (margin, panel.get_height() - margin - choice_rect.height))
 
         self.screen.blit(panel, self.side_rect)
 
