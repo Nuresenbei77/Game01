@@ -85,27 +85,31 @@ class OrderBookSnapshot:
 class MarketSim:
     MODES = {
         "preopen": {
-            "bias": 0.02,
-            "vol": 0.35,
-            "mean_revert": 0.15,
+            "bias_pct": -0.155,
+            "vol_pct": 1.27,
+            "autocorr": -0.014,
+            "mean_revert": 0.45,
             "event_rate": 0.12,
         },
         "morning": {
-            "bias": 0.01,
-            "vol": 0.28,
-            "mean_revert": 0.1,
+            "bias_pct": 0.005,
+            "vol_pct": 0.17,
+            "autocorr": -0.087,
+            "mean_revert": 0.32,
             "event_rate": 0.09,
         },
         "afternoon": {
-            "bias": 0.0,
-            "vol": 0.22,
-            "mean_revert": 0.2,
+            "bias_pct": 0.004,
+            "vol_pct": 0.16,
+            "autocorr": 0.054,
+            "mean_revert": 0.38,
             "event_rate": 0.07,
         },
         "close": {
-            "bias": -0.005,
-            "vol": 0.32,
-            "mean_revert": 0.05,
+            "bias_pct": 0.037,
+            "vol_pct": 0.16,
+            "autocorr": 0.099,
+            "mean_revert": 0.28,
             "event_rate": 0.11,
         },
     }
@@ -120,12 +124,16 @@ class MarketSim:
         "規制関連のネガティブヘッドライン",
     ]
 
-    def __init__(self, start=100.0, seed=77):
+    def __init__(self, start: float = 9200.0, seed: int = 77):
         self.rng = np.random.default_rng(seed)
-        self.base_start = start
+        self.base_start = float(start)
         self.mode = "preopen"
-        self.event_bias = 0.0
+        self.event_bias_pct = 0.0
         self.event_decay = 0
+        self.bias_pct = 0.0
+        self.vol_pct = 0.2
+        self.autocorr = 0.0
+        self.last_minute_return_pct: Optional[float] = None
         self.set_mode(self.mode)
 
     def set_mode(self, mode: str):
@@ -133,20 +141,22 @@ class MarketSim:
             mode = "preopen"
         self.mode = mode
         params = self.MODES[mode]
-        self.bias = params["bias"]
-        self.vol = params["vol"]
+        self.bias_pct = params["bias_pct"]
+        self.vol_pct = params["vol_pct"]
+        self.autocorr = params.get("autocorr", 0.0)
         self.mean_revert = params["mean_revert"]
         self.event_rate = params["event_rate"]
         self.reset_state()
 
     def reset_state(self):
-        self.last = self.base_start
-        self.anchor = self.last
+        self.last = float(self.base_start)
+        self.anchor = float(self.last)
         self.regime = "normal"
         self.regime_len = 0
         self.tick = 0
-        self.event_bias = 0.0
+        self.event_bias_pct = 0.0
         self.event_decay = 0
+        self.last_minute_return_pct = None
         self._minute_price_path: List[float] = []
         self._minute_bar_pending: Optional[Bar] = None
         self._minute_volume_total = 0.0
@@ -154,34 +164,36 @@ class MarketSim:
         self._minute_low_index: Optional[int] = None
         self._minute_observed_high: Optional[float] = None
         self._minute_observed_low: Optional[float] = None
+        self._minute_volatility_span = 0.0
 
     def _step_params(self):
         self.regime_len += 1
         if self.regime_len > self.rng.integers(120, 280):
             self.regime = "highvol" if self.regime == "normal" else "normal"
             self.regime_len = 0
-        sigma = self.vol * (1.6 if self.regime == "highvol" else 1.0)
+        sigma_factor = 1.6 if self.regime == "highvol" else 1.0
         shock = self.rng.random() < (0.08 if self.regime == "highvol" else 0.035)
-        return sigma, shock
+        return sigma_factor, shock
 
     def _apply_event_decay(self):
         if self.event_decay > 0:
             self.event_decay -= 1
-            self.event_bias *= 0.9
+            self.event_bias_pct *= 0.9
         else:
-            self.event_bias = 0.0
+            self.event_bias_pct = 0.0
 
     def maybe_event(self) -> Optional[str]:
         if self.rng.random() < self.event_rate:
             headline = self.rng.choice(self.EVENTS)
-            bias = self.rng.normal(0.0, self.vol * 2.5)
-            self.event_bias = bias
+            vol_scale = max(0.3, self.vol_pct * 1.8)
+            bias_pct = float(self.rng.normal(0.0, vol_scale))
+            self.event_bias_pct = bias_pct
             self.event_decay = self.rng.integers(40, 80)
             return headline
         return None
 
     def order_book(self) -> OrderBookSnapshot:
-        spread = max(0.02, self.vol * 0.4)
+        spread = max(self.last * 0.0004, self.last * (self.vol_pct / 100.0) * 0.6)
         bids: List[Tuple[float, float]] = []
         asks: List[Tuple[float, float]] = []
         for i in range(1, 6):
@@ -205,108 +217,126 @@ class MarketSim:
             indicative_sell=best_bid,
         )
 
-    def _prepare_minute_path(self, sigma_hint: float, shock: bool):
+    def _prepare_minute_path(self, sigma_factor: float, shock: bool):
         open_price = float(self.last)
-        baseline = (self.bias + self.event_bias)
-        mean_revert_term = (self.anchor - self.last) * self.mean_revert
-        combined_bias = (baseline + mean_revert_term) * TICKS_PER_MINUTE
-        vol_base = max(open_price * (0.0009 + self.vol * 0.0035), 0.04)
-        sigma_scale = sigma_hint * (2.0 if shock else 1.0)
-        volatility_span = vol_base * (1.0 + sigma_scale * 0.6)
-        close_move = self.rng.normal(combined_bias, volatility_span)
-        close_price = max(0.1, open_price + close_move)
+        open_log = math.log(max(open_price, 0.1))
+        baseline_pct = (self.bias_pct + self.event_bias_pct) / 100.0
+        if self.last_minute_return_pct is not None:
+            baseline_pct += (self.autocorr * (self.last_minute_return_pct / 100.0))
+        anchor_term = 0.0
+        if self.anchor > 0:
+            anchor_term = math.log(max(self.anchor, 0.1) / max(open_price, 0.1)) * self.mean_revert
+        combined_bias = baseline_pct + anchor_term
+
+        base_vol_pct = max(self.vol_pct / 100.0, 0.0004)
+        volatility_span = base_vol_pct * sigma_factor * (1.6 if shock else 1.0)
+        close_move = float(self.rng.normal(combined_bias, volatility_span))
+        close_log = open_log + close_move
 
         wick_span = volatility_span * (1.25 + self.rng.random() * 0.9)
         if shock:
             wick_span *= 1.4
-        high_price = max(open_price, close_price) + abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
-        low_price = min(open_price, close_price) - abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
-        low_price = max(0.1, low_price)
+        high_log = max(open_log, close_log) + abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
+        low_log = min(open_log, close_log) - abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
 
-        if high_price - low_price < volatility_span * 0.6:
-            pad = volatility_span * 0.4
-            high_price += pad
-            low_price = max(0.1, low_price - pad)
+        if high_log - low_log < wick_span * 0.6:
+            pad = wick_span * 0.4
+            high_log += pad
+            low_log -= pad
 
-        high_price = max(high_price, open_price, close_price) + 1e-6
-        low_price = min(low_price, open_price, close_price)
-        if high_price - low_price < 1e-4:
-            bump = max(volatility_span * 0.5, 0.02)
-            high_price += bump
-            low_price = max(0.1, low_price - bump)
+        high_log = max(high_log, open_log, close_log) + 1e-6
+        low_log = min(low_log, open_log, close_log)
+        if high_log - low_log < 1e-4:
+            bump = max(wick_span * 0.5, 0.0002)
+            high_log += bump
+            low_log -= bump
 
         first_pos = float(self.rng.uniform(0.18, 0.55))
         second_pos = float(self.rng.uniform(first_pos + 0.15, 0.92))
         if self.rng.random() < 0.5:
             positions = [0.0, first_pos, second_pos, 1.0]
-            values = [open_price, high_price, low_price, close_price]
+            values = [open_log, high_log, low_log, close_log]
             high_pos = first_pos
             low_pos = second_pos
         else:
             positions = [0.0, first_pos, second_pos, 1.0]
-            values = [open_price, low_price, high_price, close_price]
+            values = [open_log, low_log, high_log, close_log]
             low_pos = first_pos
             high_pos = second_pos
 
         ticks = TICKS_PER_MINUTE
         tick_positions = np.linspace(0.0, 1.0, ticks)
-        prices = np.interp(tick_positions, positions, values)
-        noise = self.rng.normal(0.0, volatility_span * 0.06, size=ticks)
+        log_prices = np.interp(tick_positions, positions, values)
+        noise = self.rng.normal(0.0, volatility_span * 0.18, size=ticks)
         kernel = np.array([0.15, 0.2, 0.3, 0.2, 0.15], dtype=float)
         noise = np.convolve(noise, kernel, mode="same")
-        prices = prices + noise
+        log_prices = log_prices + noise
 
         high_idx = int(np.clip(round(high_pos * (ticks - 1)), 0, ticks - 1))
         low_idx = int(np.clip(round(low_pos * (ticks - 1)), 0, ticks - 1))
-        prices = np.clip(prices, low_price, high_price)
-        prices[0] = open_price
-        prices[-1] = close_price
-        prices[high_idx] = max(prices[high_idx], high_price)
-        prices[low_idx] = min(prices[low_idx], low_price)
+        log_prices = np.clip(log_prices, low_log, high_log)
+        log_prices[0] = open_log
+        log_prices[-1] = close_log
+        log_prices[high_idx] = max(log_prices[high_idx], high_log)
+        log_prices[low_idx] = min(log_prices[low_idx], low_log)
 
-        observed_high = float(np.max(prices))
-        observed_low = float(np.min(prices))
-        if observed_high <= observed_low:
-            observed_high = observed_low + max(volatility_span * 0.4, 0.02)
+        observed_high_log = float(np.max(log_prices))
+        observed_low_log = float(np.min(log_prices))
+        if observed_high_log <= observed_low_log:
+            observed_high_log = observed_low_log + max(volatility_span * 0.4, 0.0002)
             idx = max(high_idx, low_idx)
-            prices[idx] = observed_high
+            log_prices[idx] = observed_high_log
 
-        self._minute_price_path = [float(p) for p in prices]
+        self._minute_price_path = [float(p) for p in log_prices]
         self._minute_bar_pending = Bar(
-            float(open_price),
-            float(observed_high),
-            float(observed_low),
-            float(close_price),
+            float(math.exp(open_log)),
+            float(math.exp(observed_high_log)),
+            float(math.exp(observed_low_log)),
+            float(math.exp(close_log)),
             0.0,
         )
         self._minute_volume_total = 0.0
         self._minute_high_index = int(high_idx)
         self._minute_low_index = int(low_idx)
-        self._minute_observed_high = float(observed_high)
-        self._minute_observed_low = float(observed_low)
+        self._minute_observed_high = float(math.exp(observed_high_log))
+        self._minute_observed_low = float(math.exp(observed_low_log))
+        self._minute_volatility_span = float(volatility_span)
 
     def step_ticks(self, count: int) -> Tuple[List[Tick], Optional[str]]:
         ticks: List[Tick] = []
         headline: Optional[str] = None
         for _ in range(count):
-            sigma, shock = self._step_params()
+            sigma_factor, shock = self._step_params()
             if not self._minute_price_path:
-                self._prepare_minute_path(sigma, shock)
+                self._prepare_minute_path(sigma_factor, shock)
             minute_step = self.tick % TICKS_PER_MINUTE
-            target_price = float(self._minute_price_path.pop(0))
-            jitter_scale = max(target_price, 1.0) * sigma * (0.015 if not shock else 0.028)
-            jitter = self.rng.normal(0.0, jitter_scale)
-            price = target_price + jitter
-            lower_bound = self._minute_bar_pending.l if self._minute_bar_pending else target_price
-            upper_bound = self._minute_bar_pending.h if self._minute_bar_pending else target_price
-            price = min(max(price, lower_bound), upper_bound)
-            if self._minute_high_index is not None and minute_step == self._minute_high_index:
-                price = self._minute_bar_pending.h if self._minute_bar_pending else price
-            if self._minute_low_index is not None and minute_step == self._minute_low_index:
-                price = self._minute_bar_pending.l if self._minute_bar_pending else price
+            target_log_price = float(self._minute_price_path.pop(0))
+            volatility_span = max(self._minute_volatility_span, 1e-6)
+            jitter_scale = volatility_span * (0.25 if not shock else 0.4)
+            jitter = float(self.rng.normal(0.0, jitter_scale))
+            log_price = target_log_price + jitter
+            if self._minute_bar_pending is not None:
+                lower_bound = math.log(max(self._minute_bar_pending.l, 0.1))
+                upper_bound = math.log(max(self._minute_bar_pending.h, 0.1))
+            else:
+                lower_bound = target_log_price - volatility_span * 2.0
+                upper_bound = target_log_price + volatility_span * 2.0
+            log_price = min(max(log_price, lower_bound), upper_bound)
+            if (
+                self._minute_high_index is not None
+                and minute_step == self._minute_high_index
+                and self._minute_bar_pending is not None
+            ):
+                log_price = math.log(max(self._minute_bar_pending.h, 0.1))
+            if (
+                self._minute_low_index is not None
+                and minute_step == self._minute_low_index
+                and self._minute_bar_pending is not None
+            ):
+                log_price = math.log(max(self._minute_bar_pending.l, 0.1))
             if not self._minute_price_path and self._minute_bar_pending is not None:
-                price = self._minute_bar_pending.c
-            price = max(0.1, price)
+                log_price = math.log(max(self._minute_bar_pending.c, 0.1))
+            price = max(0.1, math.exp(log_price))
             side = "BUY" if price >= self.last else "SELL"
             base_vol = float(self.rng.integers(10, 40))
             if self._minute_high_index is not None and minute_step == self._minute_high_index:
@@ -339,6 +369,10 @@ class MarketSim:
                 self._minute_volume_total = 0.0
                 self._minute_observed_high = None
                 self._minute_observed_low = None
+                if minute_bar.o > 0:
+                    self.last_minute_return_pct = math.log(max(minute_bar.c, 0.1) / max(minute_bar.o, 0.1)) * 100.0
+                else:
+                    self.last_minute_return_pct = 0.0
 
             ticks.append(Tick(price, vol, side, minute_bar))
             if headline is None and self.rng.random() < 1.0 / max(90, 240 - self.event_decay * 2):
