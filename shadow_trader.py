@@ -275,6 +275,9 @@ class ShadowTrader:
         self.tick_accumulator = 0.0
         self.post_round_summary: str = ""
         self.post_summary_ready: bool = False
+        self.preopen_minute_bars: List[Bar] = []
+        self.preopen_five_minute_bars: List[Bar] = []
+        self.preopen_tick_digest: List[Tick] = []
         self.reset_game()
 
         # 表示切替
@@ -286,6 +289,14 @@ class ShadowTrader:
         self.paused = False
 
     def reset_game(self):
+        preopen_mode = self.mode == "preopen"
+        if preopen_mode:
+            snapshot_minutes, snapshot_fives, snapshot_ticks = self._generate_preopen_snapshot(self.sim.last)
+            self.preopen_minute_bars = snapshot_minutes
+            self.preopen_five_minute_bars = snapshot_fives
+            self.preopen_tick_digest = snapshot_ticks
+            if self.preopen_minute_bars:
+                self.sim.base_start = self.preopen_minute_bars[-1].c
         self.tick_history.clear()
         self.tick_tape.clear()
         self.minute_bars: List[Bar] = []
@@ -311,14 +322,20 @@ class ShadowTrader:
         self.post_round_summary = ""
         self.post_summary_ready = False
 
-        # 初期化のため疑似的に履歴を生成
-        bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
-        remaining = max(bootstrap_ticks, 1)
-        while remaining > 0:
-            step = min(remaining, TICKS_PER_MINUTE)
-            ticks, _ = self.sim.step_ticks(step)
-            self._ingest_market_updates(ticks, headline=None)
-            remaining -= step
+        if preopen_mode:
+            self.minute_bars = list(self.preopen_minute_bars)
+            self.five_min_bars = list(self.preopen_five_minute_bars)
+            self.tick_tape = deque(self.preopen_tick_digest, maxlen=40)
+            self.tick_history = deque(self.preopen_tick_digest, maxlen=600)
+        else:
+            # 初期化のため疑似的に履歴を生成
+            bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
+            remaining = max(bootstrap_ticks, 1)
+            while remaining > 0:
+                step = min(remaining, TICKS_PER_MINUTE)
+                ticks, _ = self.sim.step_ticks(step)
+                self._ingest_market_updates(ticks, headline=None)
+                remaining -= step
         # ブートストラップ時はイベントをクリアして新鮮な状態にする
         self.event_log.clear()
         self.recent_event = None
@@ -400,7 +417,64 @@ class ShadowTrader:
             self.recent_event = headline
             self.event_log.appendleft((headline, int(FPS * 8)))
 
+    def _generate_preopen_snapshot(
+        self, start_price: float
+    ) -> Tuple[List[Bar], List[Bar], List[Tick]]:
+        seed = int(np.random.default_rng().integers(0, 1_000_000_000))
+        snapshot_sim = MarketSim(start=start_price, seed=seed)
+        snapshot_sim.set_mode("close")
+
+        minute_bars: List[Bar] = []
+        five_minute_bars: List[Bar] = []
+        tick_digest: Deque[Tick] = deque(maxlen=40)
+        current_bar: Optional[List[float]] = None
+        ticks_in_minute = 0
+        five_bucket: List[Bar] = []
+        target_minutes = max(HISTORY + 30, 120)
+
+        while len(minute_bars) < target_minutes:
+            ticks, _ = snapshot_sim.step_ticks(TICKS_PER_MINUTE)
+            for tick in ticks:
+                tick_digest.appendleft(tick)
+                if current_bar is None:
+                    current_bar = [tick.price, tick.price, tick.price, tick.price, 0.0]
+                current_bar[1] = max(current_bar[1], tick.price)
+                current_bar[2] = min(current_bar[2], tick.price)
+                current_bar[3] = tick.price
+                current_bar[4] += tick.volume
+                ticks_in_minute += 1
+                if ticks_in_minute >= TICKS_PER_MINUTE and current_bar is not None:
+                    finalized = Bar(
+                        float(current_bar[0]),
+                        float(current_bar[1]),
+                        float(current_bar[2]),
+                        float(current_bar[3]),
+                        float(current_bar[4]),
+                    )
+                    minute_bars.append(finalized)
+                    snapshot_sim.anchor = finalized.c
+                    five_bucket.append(finalized)
+                    if len(five_bucket) == 5:
+                        highs = [b.h for b in five_bucket]
+                        lows = [b.l for b in five_bucket]
+                        aggregated = Bar(
+                            five_bucket[0].o,
+                            max(highs),
+                            min(lows),
+                            five_bucket[-1].c,
+                            sum(b.v for b in five_bucket),
+                        )
+                        five_minute_bars.append(aggregated)
+                        five_bucket = []
+                    current_bar = None
+                    ticks_in_minute = 0
+
+        return minute_bars, five_minute_bars, list(tick_digest)
+
     def advance_market(self, tick_budget: Optional[int] = None):
+        if self.mode == "preopen":
+            self._decay_events()
+            return
         if tick_budget is None:
             self.tick_accumulator += TICKS_PER_FRAME_TARGET
             tick_budget = int(self.tick_accumulator)
@@ -459,6 +533,12 @@ class ShadowTrader:
 
     def update(self):
         if self.paused:
+            return
+        if self.mode == "preopen":
+            self.order_book = self.sim.order_book()
+            self._decay_events()
+            if self.result_flash_timer > 0:
+                self.result_flash_timer -= 1
             return
         if self.phase == "stream":
             self.advance_market()
