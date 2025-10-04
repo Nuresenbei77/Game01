@@ -382,6 +382,7 @@ class ShadowTrader:
             return font_obj
         self.font = make(18)
         self.font_small = make(14)
+        self.font_footer = make(16)
         self.font_big = make(24)
         self.font_big_bold = make(24, bold=True)
 
@@ -1074,10 +1075,12 @@ class ShadowTrader:
 
     def draw_footer(self):
         # 画面最下部の帯にフッター情報を表示
-        footer_rect = pygame.Rect(0, HEIGHT-60, WIDTH, 60)
+        footer_rect = pygame.Rect(0, HEIGHT - 60, WIDTH, 60)
         pygame.draw.rect(self.screen, (20, 24, 36), footer_rect)
         pygame.draw.rect(self.screen, COL_GRID, footer_rect, 1)
-        base_y = footer_rect.top + 10
+
+        margin_x = 20
+        available_width = footer_rect.width - margin_x * 2
         phase_label = {
             "stream": "観察",
             "question": "予測入力",
@@ -1095,15 +1098,109 @@ class ShadowTrader:
             f"確信度 {self.conf:.1f}",
             f"選択 {self.pred_choice or '-'}",
         ]
-        x = 20
-        for t in infos:
-            label, _ = self.font.render(t, COL_WHITE)
-            self.screen.blit(label, (x, base_y))
-            x += 150
+        info_spacing = 18
+        rows: List[List[Tuple[pygame.Surface, pygame.Rect]]] = []
+        current_row: List[Tuple[pygame.Surface, pygame.Rect]] = []
+        current_width = 0
 
-        controls = "↑=上昇 ↓=下落 Space=もみ合い ←/→=確信度 Enter=決定 M=モード 1-4=指標 H=ヘルプ P=一時停止 R=リセット"
-        surf, _ = self.font_small.render(controls, COL_DIM)
-        self.screen.blit(surf, (20, base_y+26))
+        for text in infos:
+            label, label_rect = self.font_footer.render(text, COL_WHITE)
+            required_width = label_rect.width if not current_row else current_width + info_spacing + label_rect.width
+            if current_row and required_width > available_width:
+                rows.append(current_row)
+                current_row = []
+                current_width = 0
+            if current_row:
+                current_width += info_spacing + label_rect.width
+            else:
+                current_width = label_rect.width
+            current_row.append((label, label_rect))
+        if current_row:
+            rows.append(current_row)
+
+        row_heights: List[int] = [max(label_rect.height for _, label_rect in row) for row in rows]
+
+        controls_text = "↑=上昇 ↓=下落 Space=もみ合い ←/→=確信度 Enter=決定 M=モード 1-4=指標 H=ヘルプ P=一時停止 R=リセット"
+
+        def wrap_controls(text: str) -> List[str]:
+            wrapped: List[str] = []
+            current = ""
+            for word in text.split():
+                candidate = word if not current else f"{current} {word}"
+                surf, _ = self.font_small.render(candidate, COL_DIM)
+                if surf.get_width() <= available_width:
+                    current = candidate
+                else:
+                    if current:
+                        wrapped.append(current)
+                    current = word
+            if current:
+                wrapped.append(current)
+            return wrapped or [text]
+
+        control_lines = wrap_controls(controls_text)
+        control_surfs = [self.font_small.render(line, COL_DIM)[0] for line in control_lines]
+
+        row_spacing = 4 if len(rows) > 1 else 0
+        controls_spacing = 6 if rows else 0
+        control_line_spacing = 2 if len(control_surfs) > 1 else 0
+        top_margin = 6
+        bottom_margin = 6
+
+        def total_height() -> int:
+            metrics_height = sum(row_heights)
+            if len(row_heights) > 1:
+                metrics_height += row_spacing * (len(row_heights) - 1)
+            controls_height = sum(s.get_height() for s in control_surfs)
+            if len(control_surfs) > 1:
+                controls_height += control_line_spacing * (len(control_surfs) - 1)
+            spacing = controls_spacing if control_surfs else 0
+            return top_margin + metrics_height + spacing + controls_height + bottom_margin
+
+        min_top = 2
+        min_bottom = 2
+        min_row_spacing = 2 if len(rows) > 1 else 0
+        min_controls_spacing = 2 if control_surfs else 0
+        min_control_line_spacing = 1 if len(control_surfs) > 1 else 0
+
+        while total_height() > footer_rect.height:
+            adjusted = False
+            if top_margin > min_top:
+                top_margin -= 1
+                adjusted = True
+            elif bottom_margin > min_bottom:
+                bottom_margin -= 1
+                adjusted = True
+            elif row_spacing > min_row_spacing:
+                row_spacing -= 1
+                adjusted = True
+            elif controls_spacing > min_controls_spacing:
+                controls_spacing -= 1
+                adjusted = True
+            elif control_line_spacing > min_control_line_spacing:
+                control_line_spacing -= 1
+                adjusted = True
+            else:
+                break
+        y = footer_rect.top + top_margin
+        for idx, row in enumerate(rows):
+            row_height = row_heights[idx]
+            x = footer_rect.left + margin_x
+            for label, label_rect in row:
+                self.screen.blit(label, (x, y))
+                x += label_rect.width + info_spacing
+            if idx < len(rows) - 1:
+                y += row_height + row_spacing
+            else:
+                y += row_height
+
+        if control_surfs:
+            y += controls_spacing
+            x = footer_rect.left + margin_x
+            for idx, surf in enumerate(control_surfs):
+                self.screen.blit(surf, (x, y))
+                if idx < len(control_surfs) - 1:
+                    y += surf.get_height() + control_line_spacing
 
     def draw_help(self):
         # 半透明パネル
