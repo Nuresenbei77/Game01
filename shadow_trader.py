@@ -68,6 +68,16 @@ class Tick:
     volume: float
     side: str  # "BUY" or "SELL"
 
+
+@dataclass
+class OrderBookSnapshot:
+    bids: List[Tuple[float, float]]
+    asks: List[Tuple[float, float]]
+    market_buy_qty: float
+    market_sell_qty: float
+    indicative_buy: float
+    indicative_sell: float
+
 # -------------------------
 # 擬似マーケット（OHLCV生成）
 # -------------------------
@@ -162,17 +172,30 @@ class MarketSim:
             return headline
         return None
 
-    def order_book(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    def order_book(self) -> OrderBookSnapshot:
         spread = max(0.02, self.vol * 0.4)
-        bids = []
-        asks = []
+        bids: List[Tuple[float, float]] = []
+        asks: List[Tuple[float, float]] = []
         for i in range(1, 6):
             level_spread = spread * i
             bids.append((max(0.1, self.last - level_spread), float(self.rng.integers(80, 180))))
             asks.append((self.last + level_spread, float(self.rng.integers(80, 180))))
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
-        return bids, asks
+
+        market_buy_qty = float(self.rng.integers(40, 180))
+        market_sell_qty = float(self.rng.integers(40, 180))
+        best_bid = bids[0][0] if bids else max(0.1, self.last - spread)
+        best_ask = asks[0][0] if asks else self.last + spread
+
+        return OrderBookSnapshot(
+            bids=bids,
+            asks=asks,
+            market_buy_qty=market_buy_qty,
+            market_sell_qty=market_sell_qty,
+            indicative_buy=best_ask,
+            indicative_sell=best_bid,
+        )
 
     def step_ticks(self, count: int) -> Tuple[List[Tick], Optional[str]]:
         ticks: List[Tick] = []
@@ -262,7 +285,7 @@ class ShadowTrader:
         self.event_log: Deque[Tuple[str, int]] = deque(maxlen=6)
         self.tick_tape: Deque[Tick] = deque(maxlen=40)
         self.tick_history: Deque[Tick] = deque(maxlen=600)
-        self.order_book: Tuple[List[Tuple[float, float]], List[Tuple[float, float]]] = ([], [])
+        self.order_book: OrderBookSnapshot = OrderBookSnapshot([], [], 0.0, 0.0, 0.0, 0.0)
         self.last_result: Optional[str] = None
         self.pred_choice: Optional[str] = None
         self.question_reason: str = ""
@@ -278,16 +301,12 @@ class ShadowTrader:
         self.preopen_minute_bars: List[Bar] = []
         self.preopen_five_minute_bars: List[Bar] = []
         self.preopen_tick_digest: List[Tick] = []
-        self.preopen_order_book: Tuple[
-            List[Tuple[float, float]], List[Tuple[float, float]]
-        ] = ([], [])
+        self.preopen_order_book: OrderBookSnapshot = OrderBookSnapshot([], [], 0.0, 0.0, 0.0, 0.0)
         self.cached_live_minute_bars: List[Bar] = []
         self.cached_live_five_min_bars: List[Bar] = []
         self.cached_live_tick_history: List[Tick] = []
         self.cached_live_tick_tape: List[Tick] = []
-        self.cached_live_order_book: Tuple[
-            List[Tuple[float, float]], List[Tuple[float, float]]
-        ] = ([], [])
+        self.cached_live_order_book: OrderBookSnapshot = OrderBookSnapshot([], [], 0.0, 0.0, 0.0, 0.0)
         self.previous_mode: Optional[str] = None
         self.reset_game()
 
@@ -316,7 +335,11 @@ class ShadowTrader:
             )
             self.cached_live_tick_history = list(existing_history)
             self.cached_live_tick_tape = list(existing_tape)
-            current_book = getattr(self, "order_book", ([], []))
+            current_book = getattr(
+                self,
+                "order_book",
+                OrderBookSnapshot([], [], 0.0, 0.0, 0.0, 0.0),
+            )
             self.cached_live_order_book = self._clone_order_book(current_book)
 
         if preopen_mode:
@@ -345,9 +368,7 @@ class ShadowTrader:
             five_minute_bars = list(self.preopen_five_minute_bars)
             tick_history_seed = list(self.preopen_tick_digest)
             tick_tape_seed = list(self.preopen_tick_digest)
-            order_book_seed: Optional[
-                Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]
-            ] = self.preopen_order_book
+            order_book_seed: Optional[OrderBookSnapshot] = self.preopen_order_book
         elif exiting_preopen and self.cached_live_minute_bars:
             minute_bars = list(self.cached_live_minute_bars)
             five_minute_bars = list(self.cached_live_five_min_bars)
@@ -481,13 +502,14 @@ class ShadowTrader:
         self.font_big_bold = make(24, bold=True)
 
     # -------- 進行 --------
-    def _clone_order_book(
-        self,
-        book: Tuple[List[Tuple[float, float]], List[Tuple[float, float]]],
-    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-        return (
-            [tuple(level) for level in book[0]],
-            [tuple(level) for level in book[1]],
+    def _clone_order_book(self, book: OrderBookSnapshot) -> OrderBookSnapshot:
+        return OrderBookSnapshot(
+            bids=[(float(price), float(vol)) for price, vol in book.bids],
+            asks=[(float(price), float(vol)) for price, vol in book.asks],
+            market_buy_qty=float(book.market_buy_qty),
+            market_sell_qty=float(book.market_sell_qty),
+            indicative_buy=float(book.indicative_buy),
+            indicative_sell=float(book.indicative_sell),
         )
 
     def _ingest_market_updates(self, ticks: List[Tick], headline: Optional[str]):
@@ -505,12 +527,7 @@ class ShadowTrader:
 
     def _generate_preopen_snapshot(
         self, start_price: float
-    ) -> Tuple[
-        List[Bar],
-        List[Bar],
-        List[Tick],
-        Tuple[List[Tuple[float, float]], List[Tuple[float, float]]],
-    ]:
+    ) -> Tuple[List[Bar], List[Bar], List[Tick], OrderBookSnapshot]:
         seed = int(np.random.default_rng().integers(0, 1_000_000_000))
         snapshot_sim = MarketSim(start=start_price, seed=seed)
         snapshot_sim.set_mode("close")
@@ -566,7 +583,7 @@ class ShadowTrader:
 
     def advance_market(self, tick_budget: Optional[int] = None):
         if self.mode == "preopen":
-            if self.preopen_order_book[0] or self.preopen_order_book[1]:
+            if self.preopen_order_book.bids or self.preopen_order_book.asks:
                 self.order_book = self._clone_order_book(self.preopen_order_book)
             self._decay_events()
             return
@@ -630,7 +647,7 @@ class ShadowTrader:
         if self.paused:
             return
         if self.mode == "preopen":
-            if self.preopen_order_book[0] or self.preopen_order_book[1]:
+            if self.preopen_order_book.bids or self.preopen_order_book.asks:
                 self.order_book = self._clone_order_book(self.preopen_order_book)
             self._decay_events()
             if self.result_flash_timer > 0:
@@ -1193,50 +1210,206 @@ class ShadowTrader:
 
     def draw_sidebar(self):
         # サイド情報（ヒント類）
-        pygame.draw.rect(self.screen, (20,24,36), self.side_rect)
+        pygame.draw.rect(self.screen, (20, 24, 36), self.side_rect)
         pygame.draw.rect(self.screen, COL_GRID, self.side_rect, 1)
 
         closes = [b.c for b in self.minute_bars[-HISTORY:]]
         txt_y = self.side_rect.top + 10
 
-        def put(text, col=COL_WHITE):
+        def put(text: str, col=COL_WHITE):
             nonlocal txt_y
+            if text is None:
+                txt_y += 24
+                return
             surf, _ = self.font.render(text, col)
             self.screen.blit(surf, (self.side_rect.left + 10, txt_y))
             txt_y += 24
 
         put("テクニカル概要", COL_YELLOW)
         if closes:
-            mom_k = pd.Series(closes).pct_change().rolling(5).mean().iloc[-1] if len(closes) >= 6 else 0.0
+            mom_k = (
+                pd.Series(closes).pct_change().rolling(5).mean().iloc[-1]
+                if len(closes) >= 6
+                else 0.0
+            )
             mom_k = 0.0 if pd.isna(mom_k) else float(mom_k)
             arrow = "▲" if mom_k > 0 else ("▼" if mom_k < 0 else "→")
-            put(f"{arrow} Momentum(5): {mom_k*100:+.2f}%")
+            put(f"{arrow} Momentum(5): {mom_k * 100:+.2f}%")
             vwap_list = vwap_from_bars(self.minute_bars[-HISTORY:])
             if vwap_list:
                 vwap_val = vwap_list[-1]
                 gap = (closes[-1] / vwap_val - 1.0) if vwap_val else 0.0
-                put(f"± VWAP 乖離: {gap*100:+.2f}%")
+                put(f"± VWAP 乖離: {gap * 100:+.2f}%")
             if self.show_rsi:
                 rsi_arr = rsi(closes, 14)
                 r = rsi_arr[-1] if len(rsi_arr) else float("nan")
                 if not math.isnan(r):
                     bars_txt = "▁▂▃▄▅▆▇█"
-                    level = int(max(0, min(7, r/100*7)))
+                    level = int(max(0, min(7, r / 100 * 7)))
                     put(f"{bars_txt[level]} RSI(14): {r:5.1f}")
         else:
             put("データ準備中", COL_DIM)
 
         put("")
         put("板情報", COL_YELLOW)
-        bids, asks = self.order_book
-        put("Ask", COL_GREEN)
-        for price, vol in asks[:5]:
-            put(f" {price:,.2f} x {int(vol)}", COL_GREEN)
-        put("Bid", COL_RED)
-        for price, vol in bids[:5]:
-            put(f" {price:,.2f} x {int(vol)}", COL_RED)
 
-        put("")
+        book = self.order_book
+        show_market_rows = self.mode in ("preopen", "close")
+        bids = list(book.bids)
+        asks = list(book.asks)
+        ask_levels = list(reversed(asks[:5]))
+        bid_levels = bids[:5]
+        while len(ask_levels) < 5:
+            ask_levels.append((None, None))
+        while len(bid_levels) < 5:
+            bid_levels.append((None, None))
+
+        ask_total = int(sum(vol for _, vol in asks[:5])) if asks else 0
+        bid_total = int(sum(vol for _, vol in bids[:5])) if bids else 0
+        indicative_mid = (
+            (book.indicative_buy + book.indicative_sell) / 2.0
+            if book.indicative_buy and book.indicative_sell
+            else (book.indicative_buy or book.indicative_sell or 0.0)
+        )
+
+        rows: List[Tuple[str, str, str]] = []
+        if show_market_rows:
+            rows.append(("market_sell", "成行売り", f"{int(book.market_sell_qty):,}"))
+        rows.append(("indicative_sell", "売気配", f"{book.indicative_sell:,.2f}"))
+        rows.append(("header", "価格", "数量"))
+        for price, vol in ask_levels:
+            price_text = "-" if price is None else f"{price:,.2f}"
+            qty_text = "-" if (vol is None or vol <= 0) else f"{int(vol):,}"
+            rows.append(("ask", price_text, qty_text))
+        rows.append(("ask_total", "売合計", "-" if ask_total == 0 else f"{ask_total:,}"))
+        rows.append(("indicative_mid", "気配値", f"{indicative_mid:,.2f}"))
+        for price, vol in bid_levels:
+            price_text = "-" if price is None else f"{price:,.2f}"
+            qty_text = "-" if (vol is None or vol <= 0) else f"{int(vol):,}"
+            rows.append(("bid", price_text, qty_text))
+        rows.append(("bid_total", "買合計", "-" if bid_total == 0 else f"{bid_total:,}"))
+        rows.append(("indicative_buy", "買気配", f"{book.indicative_buy:,.2f}"))
+        if show_market_rows:
+            rows.append(("market_buy", "成行買い", f"{int(book.market_buy_qty):,}"))
+
+        table_margin = 10
+        table_x = self.side_rect.left + table_margin
+        table_width = self.side_rect.width - table_margin * 2
+        row_height = self.font_small.get_sized_height() + 6
+        table_height = max(row_height * len(rows), row_height)
+        table_y = txt_y
+        table_rect = pygame.Rect(table_x, table_y, table_width, table_height)
+        pygame.draw.rect(self.screen, (18, 22, 34), table_rect)
+        pygame.draw.rect(self.screen, COL_GRID, table_rect, 1)
+
+        price_col_width = int(table_width * 0.55)
+        col_split = table_rect.left + price_col_width
+
+        color_map = {
+            "header": COL_DIM,
+            "ask": COL_GREEN,
+            "ask_total": COL_GREEN,
+            "market_sell": COL_GREEN,
+            "indicative_sell": COL_GREEN,
+            "bid": COL_RED,
+            "bid_total": COL_RED,
+            "market_buy": COL_RED,
+            "indicative_buy": COL_RED,
+            "indicative_mid": COL_YELLOW,
+        }
+
+        bg_map = {
+            "header": (26, 30, 46),
+            "ask": (32, 24, 28),
+            "ask_total": (40, 30, 42),
+            "indicative_sell": (30, 32, 42),
+            "indicative_mid": (34, 34, 46),
+            "bid": (24, 32, 28),
+            "bid_total": (40, 30, 42),
+            "indicative_buy": (30, 32, 42),
+            "market_sell": (34, 28, 36),
+            "market_buy": (34, 28, 36),
+        }
+
+        def blit_cell(text: str, rect: pygame.Rect, align: str, color):
+            if not text:
+                return
+            color_to_use = COL_DIM if text == "-" else color
+            surf, surf_rect = self.font_small.render(text, color_to_use)
+            if align == "right":
+                surf_rect.topright = (
+                    rect.right - 6,
+                    rect.top + (row_height - surf_rect.height) // 2,
+                )
+            elif align == "center":
+                surf_rect.center = (
+                    rect.centerx,
+                    rect.top + row_height // 2,
+                )
+            else:
+                surf_rect.topleft = (
+                    rect.left + 6,
+                    rect.top + (row_height - surf_rect.height) // 2,
+                )
+            self.screen.blit(surf, surf_rect)
+
+        prev_type: Optional[str] = None
+        for i, (row_type, price_text, qty_text) in enumerate(rows):
+            row_rect = pygame.Rect(
+                table_rect.left,
+                table_rect.top + i * row_height,
+                table_width,
+                row_height,
+            )
+            bg = bg_map.get(row_type, (22, 26, 38))
+            pygame.draw.rect(self.screen, bg, row_rect)
+
+            if prev_type not in {None, row_type} and row_type in {"bid", "market_buy"}:
+                pygame.draw.line(
+                    self.screen,
+                    COL_GRID,
+                    (row_rect.left, row_rect.top),
+                    (row_rect.right, row_rect.top),
+                    2,
+                )
+            if row_type in {"indicative_mid", "indicative_buy"}:
+                pygame.draw.line(
+                    self.screen,
+                    COL_GRID,
+                    (row_rect.left, row_rect.top),
+                    (row_rect.right, row_rect.top),
+                    2,
+                )
+
+            price_rect = pygame.Rect(row_rect.left, row_rect.top, price_col_width, row_height)
+            qty_rect = pygame.Rect(col_split, row_rect.top, table_width - price_col_width, row_height)
+
+            pygame.draw.line(
+                self.screen,
+                COL_GRID,
+                (col_split, row_rect.top),
+                (col_split, row_rect.bottom),
+            )
+            pygame.draw.line(
+                self.screen,
+                COL_GRID,
+                (row_rect.left, row_rect.bottom),
+                (row_rect.right, row_rect.bottom),
+            )
+
+            color = color_map.get(row_type, COL_WHITE)
+            price_align = "right" if row_type in {"ask", "bid"} else "left"
+            qty_align = "right"
+            blit_cell(price_text, price_rect, price_align, color)
+            if qty_text:
+                blit_cell(qty_text, qty_rect, qty_align, color)
+
+            prev_type = row_type
+
+        pygame.draw.rect(self.screen, COL_GRID, table_rect, 1)
+
+        txt_y = table_rect.bottom + 16
+
         put("イベント", COL_YELLOW)
         if self.event_log:
             for msg, _ in list(self.event_log):
