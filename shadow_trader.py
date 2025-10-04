@@ -278,6 +278,17 @@ class ShadowTrader:
         self.preopen_minute_bars: List[Bar] = []
         self.preopen_five_minute_bars: List[Bar] = []
         self.preopen_tick_digest: List[Tick] = []
+        self.preopen_order_book: Tuple[
+            List[Tuple[float, float]], List[Tuple[float, float]]
+        ] = ([], [])
+        self.cached_live_minute_bars: List[Bar] = []
+        self.cached_live_five_min_bars: List[Bar] = []
+        self.cached_live_tick_history: List[Tick] = []
+        self.cached_live_tick_tape: List[Tick] = []
+        self.cached_live_order_book: Tuple[
+            List[Tuple[float, float]], List[Tuple[float, float]]
+        ] = ([], [])
+        self.previous_mode: Optional[str] = None
         self.reset_game()
 
         # 表示切替
@@ -289,22 +300,85 @@ class ShadowTrader:
         self.paused = False
 
     def reset_game(self):
+        previous_mode = self.previous_mode if self.previous_mode is not None else self.mode
         preopen_mode = self.mode == "preopen"
+        entering_preopen = preopen_mode and previous_mode != "preopen"
+        exiting_preopen = previous_mode == "preopen" and not preopen_mode
+
+        if entering_preopen:
+            self.cached_live_minute_bars = list(getattr(self, "minute_bars", []))
+            self.cached_live_five_min_bars = list(getattr(self, "five_min_bars", []))
+            existing_history: Deque[Tick] = getattr(
+                self, "tick_history", deque(maxlen=600)
+            )
+            existing_tape: Deque[Tick] = getattr(
+                self, "tick_tape", deque(maxlen=40)
+            )
+            self.cached_live_tick_history = list(existing_history)
+            self.cached_live_tick_tape = list(existing_tape)
+            current_book = getattr(self, "order_book", ([], []))
+            self.cached_live_order_book = self._clone_order_book(current_book)
+
         if preopen_mode:
-            snapshot_minutes, snapshot_fives, snapshot_ticks = self._generate_preopen_snapshot(self.sim.last)
+            snapshot_start = (
+                self.cached_live_minute_bars[-1].c
+                if self.cached_live_minute_bars
+                else self.sim.last
+            )
+            (
+                snapshot_minutes,
+                snapshot_fives,
+                snapshot_ticks,
+                snapshot_book,
+            ) = self._generate_preopen_snapshot(snapshot_start)
             self.preopen_minute_bars = snapshot_minutes
             self.preopen_five_minute_bars = snapshot_fives
             self.preopen_tick_digest = snapshot_ticks
+            self.preopen_order_book = self._clone_order_book(snapshot_book)
             if self.preopen_minute_bars:
                 self.sim.base_start = self.preopen_minute_bars[-1].c
-        self.tick_history.clear()
-        self.tick_tape.clear()
-        self.minute_bars: List[Bar] = []
-        self.five_min_bars: List[Bar] = []
+        elif exiting_preopen and self.cached_live_minute_bars:
+            self.sim.base_start = self.cached_live_minute_bars[-1].c
+
+        if preopen_mode:
+            minute_bars = list(self.preopen_minute_bars)
+            five_minute_bars = list(self.preopen_five_minute_bars)
+            tick_history_seed = list(self.preopen_tick_digest)
+            tick_tape_seed = list(self.preopen_tick_digest)
+            order_book_seed: Optional[
+                Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]
+            ] = self.preopen_order_book
+        elif exiting_preopen and self.cached_live_minute_bars:
+            minute_bars = list(self.cached_live_minute_bars)
+            five_minute_bars = list(self.cached_live_five_min_bars)
+            tick_history_seed = list(self.cached_live_tick_history)
+            tick_tape_seed = list(self.cached_live_tick_tape)
+            order_book_seed = self.cached_live_order_book
+        else:
+            minute_bars = []
+            five_minute_bars = []
+            tick_history_seed = []
+            tick_tape_seed = []
+            order_book_seed = None
+
+        self.tick_history = deque(tick_history_seed, maxlen=600)
+        self.tick_tape = deque(tick_tape_seed, maxlen=40)
+        self.minute_bars = minute_bars
+        self.five_min_bars = five_minute_bars
         self.current_minute_bar: Optional[List[float]] = None
         self.current_minute_ticks = 0
         self.current_five_bucket: List[Bar] = []
+
+        if not preopen_mode and self.minute_bars:
+            self.sim.base_start = self.minute_bars[-1].c
+
         self.sim.set_mode(self.mode)
+
+        if order_book_seed is not None:
+            self.order_book = self._clone_order_book(order_book_seed)
+        else:
+            self.order_book = self.sim.order_book()
+
         self.round = 1
         self.score = 0.0
         self.streak = 0
@@ -317,28 +391,31 @@ class ShadowTrader:
         self.result_flash_timer = 0
         self.anchor_price = None
         self.recent_event = None
-        self.order_book = self.sim.order_book()
         self.tick_accumulator = 0.0
         self.post_round_summary = ""
         self.post_summary_ready = False
 
         if preopen_mode:
-            self.minute_bars = list(self.preopen_minute_bars)
-            self.five_min_bars = list(self.preopen_five_minute_bars)
-            self.tick_tape = deque(self.preopen_tick_digest, maxlen=40)
-            self.tick_history = deque(self.preopen_tick_digest, maxlen=600)
+            pass
         else:
             # 初期化のため疑似的に履歴を生成
-            bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
-            remaining = max(bootstrap_ticks, 1)
-            while remaining > 0:
-                step = min(remaining, TICKS_PER_MINUTE)
-                ticks, _ = self.sim.step_ticks(step)
-                self._ingest_market_updates(ticks, headline=None)
-                remaining -= step
+            if not self.minute_bars:
+                bootstrap_ticks = (HISTORY + 10) * TICKS_PER_MINUTE
+                remaining = max(bootstrap_ticks, 1)
+                while remaining > 0:
+                    step = min(remaining, TICKS_PER_MINUTE)
+                    ticks, _ = self.sim.step_ticks(step)
+                    self._ingest_market_updates(ticks, headline=None)
+                    remaining -= step
+            self.cached_live_minute_bars = list(self.minute_bars)
+            self.cached_live_five_min_bars = list(self.five_min_bars)
+            self.cached_live_tick_history = list(self.tick_history)
+            self.cached_live_tick_tape = list(self.tick_tape)
+            self.cached_live_order_book = self._clone_order_book(self.order_book)
         # ブートストラップ時はイベントをクリアして新鮮な状態にする
         self.event_log.clear()
         self.recent_event = None
+        self.previous_mode = self.mode
 
     def load_fonts(self):
         """日本語フォントを優先して読み込む。"""
@@ -404,6 +481,15 @@ class ShadowTrader:
         self.font_big_bold = make(24, bold=True)
 
     # -------- 進行 --------
+    def _clone_order_book(
+        self,
+        book: Tuple[List[Tuple[float, float]], List[Tuple[float, float]]],
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        return (
+            [tuple(level) for level in book[0]],
+            [tuple(level) for level in book[1]],
+        )
+
     def _ingest_market_updates(self, ticks: List[Tick], headline: Optional[str]):
         if ticks:
             self.order_book = self.sim.order_book()
@@ -419,7 +505,12 @@ class ShadowTrader:
 
     def _generate_preopen_snapshot(
         self, start_price: float
-    ) -> Tuple[List[Bar], List[Bar], List[Tick]]:
+    ) -> Tuple[
+        List[Bar],
+        List[Bar],
+        List[Tick],
+        Tuple[List[Tuple[float, float]], List[Tuple[float, float]]],
+    ]:
         seed = int(np.random.default_rng().integers(0, 1_000_000_000))
         snapshot_sim = MarketSim(start=start_price, seed=seed)
         snapshot_sim.set_mode("close")
@@ -469,10 +560,14 @@ class ShadowTrader:
                     current_bar = None
                     ticks_in_minute = 0
 
-        return minute_bars, five_minute_bars, list(tick_digest)
+        order_book = snapshot_sim.order_book()
+
+        return minute_bars, five_minute_bars, list(tick_digest), order_book
 
     def advance_market(self, tick_budget: Optional[int] = None):
         if self.mode == "preopen":
+            if self.preopen_order_book[0] or self.preopen_order_book[1]:
+                self.order_book = self._clone_order_book(self.preopen_order_book)
             self._decay_events()
             return
         if tick_budget is None:
@@ -535,7 +630,8 @@ class ShadowTrader:
         if self.paused:
             return
         if self.mode == "preopen":
-            self.order_book = self.sim.order_book()
+            if self.preopen_order_book[0] or self.preopen_order_book[1]:
+                self.order_book = self._clone_order_book(self.preopen_order_book)
             self._decay_events()
             if self.result_flash_timer > 0:
                 self.result_flash_timer -= 1
@@ -574,10 +670,12 @@ class ShadowTrader:
 
     def cycle_mode(self):
         if self.mode not in self.mode_cycle:
-            self.mode = self.mode_cycle[0]
+            next_mode = self.mode_cycle[0]
         else:
             idx = self.mode_cycle.index(self.mode)
-            self.mode = self.mode_cycle[(idx + 1) % len(self.mode_cycle)]
+            next_mode = self.mode_cycle[(idx + 1) % len(self.mode_cycle)]
+        self.previous_mode = self.mode
+        self.mode = next_mode
         self.reset_game()
 
     def prepare_question(self):
