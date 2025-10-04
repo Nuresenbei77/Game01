@@ -67,6 +67,7 @@ class Tick:
     price: float
     volume: float
     side: str  # "BUY" or "SELL"
+    minute_bar: Optional[Bar] = None
 
 
 @dataclass
@@ -146,6 +147,13 @@ class MarketSim:
         self.tick = 0
         self.event_bias = 0.0
         self.event_decay = 0
+        self._minute_price_path: List[float] = []
+        self._minute_bar_pending: Optional[Bar] = None
+        self._minute_volume_total = 0.0
+        self._minute_high_index: Optional[int] = None
+        self._minute_low_index: Optional[int] = None
+        self._minute_observed_high: Optional[float] = None
+        self._minute_observed_low: Optional[float] = None
 
     def _step_params(self):
         self.regime_len += 1
@@ -197,20 +205,142 @@ class MarketSim:
             indicative_sell=best_bid,
         )
 
+    def _prepare_minute_path(self, sigma_hint: float, shock: bool):
+        open_price = float(self.last)
+        baseline = (self.bias + self.event_bias)
+        mean_revert_term = (self.anchor - self.last) * self.mean_revert
+        combined_bias = (baseline + mean_revert_term) * TICKS_PER_MINUTE
+        vol_base = max(open_price * (0.0009 + self.vol * 0.0035), 0.04)
+        sigma_scale = sigma_hint * (2.0 if shock else 1.0)
+        volatility_span = vol_base * (1.0 + sigma_scale * 0.6)
+        close_move = self.rng.normal(combined_bias, volatility_span)
+        close_price = max(0.1, open_price + close_move)
+
+        wick_span = volatility_span * (1.25 + self.rng.random() * 0.9)
+        if shock:
+            wick_span *= 1.4
+        high_price = max(open_price, close_price) + abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
+        low_price = min(open_price, close_price) - abs(self.rng.normal(wick_span * 0.6, wick_span * 0.35))
+        low_price = max(0.1, low_price)
+
+        if high_price - low_price < volatility_span * 0.6:
+            pad = volatility_span * 0.4
+            high_price += pad
+            low_price = max(0.1, low_price - pad)
+
+        high_price = max(high_price, open_price, close_price) + 1e-6
+        low_price = min(low_price, open_price, close_price)
+        if high_price - low_price < 1e-4:
+            bump = max(volatility_span * 0.5, 0.02)
+            high_price += bump
+            low_price = max(0.1, low_price - bump)
+
+        first_pos = float(self.rng.uniform(0.18, 0.55))
+        second_pos = float(self.rng.uniform(first_pos + 0.15, 0.92))
+        if self.rng.random() < 0.5:
+            positions = [0.0, first_pos, second_pos, 1.0]
+            values = [open_price, high_price, low_price, close_price]
+            high_pos = first_pos
+            low_pos = second_pos
+        else:
+            positions = [0.0, first_pos, second_pos, 1.0]
+            values = [open_price, low_price, high_price, close_price]
+            low_pos = first_pos
+            high_pos = second_pos
+
+        ticks = TICKS_PER_MINUTE
+        tick_positions = np.linspace(0.0, 1.0, ticks)
+        prices = np.interp(tick_positions, positions, values)
+        noise = self.rng.normal(0.0, volatility_span * 0.06, size=ticks)
+        kernel = np.array([0.15, 0.2, 0.3, 0.2, 0.15], dtype=float)
+        noise = np.convolve(noise, kernel, mode="same")
+        prices = prices + noise
+
+        high_idx = int(np.clip(round(high_pos * (ticks - 1)), 0, ticks - 1))
+        low_idx = int(np.clip(round(low_pos * (ticks - 1)), 0, ticks - 1))
+        prices = np.clip(prices, low_price, high_price)
+        prices[0] = open_price
+        prices[-1] = close_price
+        prices[high_idx] = max(prices[high_idx], high_price)
+        prices[low_idx] = min(prices[low_idx], low_price)
+
+        observed_high = float(np.max(prices))
+        observed_low = float(np.min(prices))
+        if observed_high <= observed_low:
+            observed_high = observed_low + max(volatility_span * 0.4, 0.02)
+            idx = max(high_idx, low_idx)
+            prices[idx] = observed_high
+
+        self._minute_price_path = [float(p) for p in prices]
+        self._minute_bar_pending = Bar(
+            float(open_price),
+            float(observed_high),
+            float(observed_low),
+            float(close_price),
+            0.0,
+        )
+        self._minute_volume_total = 0.0
+        self._minute_high_index = int(high_idx)
+        self._minute_low_index = int(low_idx)
+        self._minute_observed_high = float(observed_high)
+        self._minute_observed_low = float(observed_low)
+
     def step_ticks(self, count: int) -> Tuple[List[Tick], Optional[str]]:
         ticks: List[Tick] = []
         headline: Optional[str] = None
         for _ in range(count):
             sigma, shock = self._step_params()
-            drift = self.bias + self.event_bias
-            mean_revert = (self.anchor - self.last) * self.mean_revert
-            move = self.rng.normal(drift + mean_revert, sigma * (2.0 if shock else 1.0))
-            new_price = max(0.1, self.last + move)
-            side = "BUY" if new_price >= self.last else "SELL"
-            vol = float(self.rng.integers(10, 40))
-            self.last = new_price
+            if not self._minute_price_path:
+                self._prepare_minute_path(sigma, shock)
+            minute_step = self.tick % TICKS_PER_MINUTE
+            target_price = float(self._minute_price_path.pop(0))
+            jitter_scale = max(target_price, 1.0) * sigma * (0.015 if not shock else 0.028)
+            jitter = self.rng.normal(0.0, jitter_scale)
+            price = target_price + jitter
+            lower_bound = self._minute_bar_pending.l if self._minute_bar_pending else target_price
+            upper_bound = self._minute_bar_pending.h if self._minute_bar_pending else target_price
+            price = min(max(price, lower_bound), upper_bound)
+            if self._minute_high_index is not None and minute_step == self._minute_high_index:
+                price = self._minute_bar_pending.h if self._minute_bar_pending else price
+            if self._minute_low_index is not None and minute_step == self._minute_low_index:
+                price = self._minute_bar_pending.l if self._minute_bar_pending else price
+            if not self._minute_price_path and self._minute_bar_pending is not None:
+                price = self._minute_bar_pending.c
+            price = max(0.1, price)
+            side = "BUY" if price >= self.last else "SELL"
+            base_vol = float(self.rng.integers(10, 40))
+            if self._minute_high_index is not None and minute_step == self._minute_high_index:
+                base_vol *= 1.4
+            if self._minute_low_index is not None and minute_step == self._minute_low_index:
+                base_vol *= 1.3
+            vol = float(base_vol)
+            self.last = price
             self.tick += 1
-            ticks.append(Tick(new_price, vol, side))
+            self._minute_volume_total += vol
+            if self._minute_observed_high is not None:
+                self._minute_observed_high = max(self._minute_observed_high, price)
+            if self._minute_observed_low is not None:
+                self._minute_observed_low = min(self._minute_observed_low, price)
+
+            minute_bar = None
+            if not self._minute_price_path and self._minute_bar_pending is not None:
+                observed_high = self._minute_observed_high if self._minute_observed_high is not None else price
+                observed_low = self._minute_observed_low if self._minute_observed_low is not None else price
+                minute_bar = Bar(
+                    float(self._minute_bar_pending.o),
+                    float(observed_high),
+                    float(observed_low),
+                    float(price),
+                    float(self._minute_volume_total),
+                )
+                self._minute_bar_pending = None
+                self._minute_high_index = None
+                self._minute_low_index = None
+                self._minute_volume_total = 0.0
+                self._minute_observed_high = None
+                self._minute_observed_low = None
+
+            ticks.append(Tick(price, vol, side, minute_bar))
             if headline is None and self.rng.random() < 1.0 / max(90, 240 - self.event_decay * 2):
                 headline = self.maybe_event()
             self._apply_event_decay()
@@ -551,17 +681,29 @@ class ShadowTrader:
                 current_bar[3] = tick.price
                 current_bar[4] += tick.volume
                 ticks_in_minute += 1
-                if ticks_in_minute >= TICKS_PER_MINUTE and current_bar is not None:
-                    finalized = Bar(
+                finalized_bar: Optional[Bar] = None
+                if tick.minute_bar is not None:
+                    summary = tick.minute_bar
+                    finalized_bar = Bar(
+                        float(summary.o),
+                        float(summary.h),
+                        float(summary.l),
+                        float(summary.c),
+                        float(summary.v),
+                    )
+                elif ticks_in_minute >= TICKS_PER_MINUTE and current_bar is not None:
+                    finalized_bar = Bar(
                         float(current_bar[0]),
                         float(current_bar[1]),
                         float(current_bar[2]),
                         float(current_bar[3]),
                         float(current_bar[4]),
                     )
-                    minute_bars.append(finalized)
-                    snapshot_sim.anchor = finalized.c
-                    five_bucket.append(finalized)
+
+                if finalized_bar is not None:
+                    minute_bars.append(finalized_bar)
+                    snapshot_sim.anchor = finalized_bar.c
+                    five_bucket.append(finalized_bar)
                     if len(five_bucket) == 5:
                         highs = [b.h for b in five_bucket]
                         lows = [b.l for b in five_bucket]
@@ -620,8 +762,19 @@ class ShadowTrader:
         bar[3] = price
         bar[4] += volume
         self.current_minute_ticks += 1
-        if self.current_minute_ticks >= TICKS_PER_MINUTE:
-            finalized = Bar(bar[0], bar[1], bar[2], bar[3], bar[4])
+        finalized: Optional[Bar] = None
+        if tick.minute_bar is not None:
+            summary = tick.minute_bar
+            finalized = Bar(
+                float(summary.o),
+                float(summary.h),
+                float(summary.l),
+                float(summary.c),
+                float(summary.v),
+            )
+        elif self.current_minute_ticks >= TICKS_PER_MINUTE:
+            finalized = Bar(float(bar[0]), float(bar[1]), float(bar[2]), float(bar[3]), float(bar[4]))
+        if finalized is not None:
             self.minute_bars.append(finalized)
             self.sim.anchor = finalized.c
             self.current_minute_bar = None
