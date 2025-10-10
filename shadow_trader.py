@@ -28,12 +28,13 @@ FPS = 30
 HISTORY = 90              # 表示するバー本数
 SIM_SECONDS_PER_MINUTE = 30  # 疑似1分足が経過する現実秒
 TICKS_PER_MINUTE = 60        # 疑似1分を構成する歩み値数
+PREDICTION_MINUTES = 5       # 予測の評価に用いる未来の分数
 TICKS_PER_SECOND = TICKS_PER_MINUTE / SIM_SECONDS_PER_MINUTE
 TICKS_PER_FRAME_TARGET = TICKS_PER_SECOND / FPS
 STREAM_SECONDS = 20          # 観察フェーズ（実時間秒）
-POST_SECONDS = 10            # 回答後の結果観察（実時間秒）
+POST_DISPLAY_SECONDS = 6     # 結果表示のための短い観察時間
 STREAM_FRAMES = int(STREAM_SECONDS * FPS)
-POST_FRAMES = int(POST_SECONDS * FPS)
+POST_DISPLAY_FRAMES = int(POST_DISPLAY_SECONDS * FPS)
 
 # フォント候補
 FONT_BUNDLED = os.path.join(os.path.dirname(__file__), "assets", "fonts", "NotoSansJP-Regular.otf")
@@ -852,12 +853,13 @@ class ShadowTrader:
             # 質問中は描画のみ。イベント寿命だけ進める
             self._decay_events()
         elif self.phase == "post":
-            self.advance_market()
-            self.phase_timer -= 1
-            if self.phase_timer <= 0:
-                if not self.post_summary_ready:
-                    self.resolve_round()
-                else:
+            if not self.post_summary_ready:
+                self.resolve_round()
+                self.post_summary_ready = True
+                self.phase_timer = POST_DISPLAY_FRAMES
+            else:
+                self.phase_timer -= 1
+                if self.phase_timer <= 0:
                     self.start_stream_phase()
         if self.result_flash_timer > 0:
             self.result_flash_timer -= 1
@@ -891,15 +893,21 @@ class ShadowTrader:
 
     def start_post_phase(self):
         self.phase = "post"
-        self.phase_timer = POST_FRAMES
         self.post_round_summary = ""
         self.post_summary_ready = False
+        if self.anchor_price is None:
+            self.anchor_price = self.sim.last
+        future_ticks = int(PREDICTION_MINUTES * TICKS_PER_MINUTE)
+        self.advance_market(tick_budget=future_ticks)
+        self.resolve_round()
+        self.post_summary_ready = True
+        self.phase_timer = POST_DISPLAY_FRAMES
 
     def resolve_round(self):
         if self.anchor_price is None:
             self.post_round_summary = "観測データ不足のため評価できませんでした"
-            self.post_summary_ready = True
-            self.phase_timer = POST_FRAMES
+            self.last_result = "結果: 評価対象データ不足"
+            self.result_flash_timer = FPS * 2
             return
         current_price = self.sim.last
         delta = (current_price - self.anchor_price) / max(self.anchor_price, 1e-6)
@@ -911,9 +919,7 @@ class ShadowTrader:
             actual = "DOWN"
 
         self.post_round_summary = self.build_post_round_summary(actual, delta, self.anchor_price, current_price)
-        self.post_summary_ready = True
-        self.phase_timer = POST_FRAMES
-        self.last_result = f"結果: {actual} (Δ {delta*100:+.2f}%)"
+        self.last_result = f"結果(5分先): {actual} (Δ {delta*100:+.2f}%)"
         self.result_flash_timer = FPS * 3
         self.evaluate_score(actual)
 
@@ -970,6 +976,7 @@ class ShadowTrader:
         direction_map = {"UP": "上昇", "DOWN": "下落", "RANGE": "もみ合い"}
         actual_label = direction_map.get(actual, actual)
         lines: List[str] = []
+        lines.append("予測から5分先の高速シミュレーション結果です。")
         lines.append(
             f"実現値動き: {anchor:,.2f}→{current_price:,.2f} ({delta*100:+.2f}%) → {actual_label}"
         )
@@ -1338,13 +1345,13 @@ class ShadowTrader:
         y = margin
 
         if self.post_summary_ready and self.post_round_summary:
-            title_text = "ラウンド結果サマリー"
+            title_text = "ラウンド結果サマリー (5分先)"
             sections = [line.strip() for line in self.post_round_summary.split("\n")]
         else:
-            title_text = "結果観察フェーズ"
+            title_text = "結果観察フェーズ (5分先)"
             remaining = max(0, math.ceil(self.phase_timer / FPS))
             sections = [
-                "値動きの確定を観察しています。",
+                "5分先の値動きを高速で確定しています。",
                 f"残り {remaining}s",
             ]
 
