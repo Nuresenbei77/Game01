@@ -1,0 +1,11 @@
+width: 1100
+height: 760
+fps: 30
+history_length: 90
+sim_seconds_per_minute: 30
+ticks_per_minute: 60
+prediction_minutes: 5
+stream_seconds: 20
+post_display_seconds: 6
+board_levels: 5
+log_root: runs
